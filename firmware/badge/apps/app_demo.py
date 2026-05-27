@@ -57,6 +57,10 @@ class Demo(BaseApp):
             print("READ MORE ")
         if self.badge.keyboard.f4():
             print("HACKADAY!")
+        if self.badge.keyboard.f2():
+            self.food_pin.value(Pin.LOW)
+        if self.badge.keyboard.f3():
+            self.food_pin.value(Pin.HIGH)
         ## Co-op multitasking: all you have to do is get out
         if self.badge.keyboard.f5():
             self.badge.display.clear()
@@ -85,6 +89,10 @@ class Demo(BaseApp):
         self.p.create_content()
         self.p.create_menubar(["Hello", "World", "Read more", "Hackaday", "Done"])
         self.p.replace_screen()
+        self.food_pin = board.SAO_GPIO1
+        self.food_pin.init(Pin.OUT)
+        self.paracetamol_pin = board.SAO_GPIO2
+        self.paracetamol_pin.init(Pin.OUT)
 
 
     def switch_to_background(self):
@@ -94,4 +102,3 @@ class Demo(BaseApp):
         """
         self.p = None
         super().switch_to_background()
-
