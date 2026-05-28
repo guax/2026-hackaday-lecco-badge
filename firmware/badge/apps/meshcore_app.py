@@ -42,7 +42,7 @@ class MeshcoreApp(BaseApp):
         self.mode = MODE_MENU
         # Channels list state: ordered list of (channel_id, name) and the selection cursor.
         self._channel_order = []
-        self._channel_rows_cache = []
+        self._chan_labels = []
         self.channel_sel = 0
         # Channel view state
         self.active_channel_id = None
@@ -180,37 +180,66 @@ class MeshcoreApp(BaseApp):
             rows.append((name, "{} msg".format(count)))
         return rows
 
+    # Number of channel rows visible at once in the list (windowed scrolling).
+    LIST_MAX_VISIBLE = 5
+    LIST_ROW_PX = 18
+
     def _build_channels(self):
         self._refresh_channel_order()
         self.page = Page()
         self.page.create_infobar(["Channels", "Up/Dn select"])
         self.page.create_content()
-        rows = self._channel_rows()
-        self.page.add_message_rows(max(1, len(rows)), left_width=300)
-        self._populate_channel_list(rows)
+        self._chan_labels = []
+        self._draw_channel_list()
         self.page.create_menubar(["Open", "Add", "Del", "Menu", "Home"])
         self.page.replace_screen()
 
-    def _populate_channel_list(self, rows):
-        table = self.page.message_rows
-        if not rows:
-            table.set_row_count(1)
-            table.set_cell_value(0, 0, "(no channels configured)")
-            table.set_cell_value(0, 1, "")
-            return
-        table.set_row_count(len(rows))
-        self._channel_rows_cache = rows
-        self._render_channel_selection()
+    def _draw_channel_list(self):
+        """Render a windowed, highlight-bar selection list of channels.
 
-    def _render_channel_selection(self):
-        """Draw a '>' marker on the selected row so the cursor is clearly visible."""
-        table = self.page.message_rows
-        rows = self._channel_rows_cache
-        for i, (name, count) in enumerate(rows):
-            marker = "> " if i == self.channel_sel else "  "
-            table.set_cell_value(i, 0, marker + name)
-            table.set_cell_value(i, 1, count)
-        table.set_selected_cell(self.channel_sel, 0)
+        Windowing keeps the selected row on screen (scroll-into-view), and the
+        selected row gets a filled background bar instead of a text marker."""
+        for label in self._chan_labels:
+            label.delete()
+        self._chan_labels = []
+        if not self.page or not self.page.content:
+            return
+
+        rows = self._channel_rows()
+        if not rows:
+            empty = lvgl.label(self.page.content)
+            empty.add_style(styles.content_style, 0)
+            empty.align(lvgl.ALIGN.TOP_LEFT, 8, 5)
+            empty.set_text("(no channels configured)")
+            self._chan_labels.append(empty)
+            return
+
+        # Determine the visible window, centering the selection when possible.
+        max_visible = self.LIST_MAX_VISIBLE
+        start = 0
+        if len(rows) > max_visible:
+            start = max(0, self.channel_sel - max_visible // 2)
+            start = min(start, len(rows) - max_visible)
+        end = min(start + max_visible, len(rows))
+
+        y = 4
+        for i in range(start, end):
+            name, count = rows[i]
+            label = lvgl.label(self.page.content)
+            label.add_style(styles.content_style, 0)
+            label.set_width(lvgl.pct(100))
+            label.set_style_pad_top(2, 0)
+            label.set_style_pad_bottom(2, 0)
+            label.set_style_pad_left(8, 0)
+            label.set_text("{}   {}".format(name, count))
+            if i == self.channel_sel:
+                # Highlight bar: filled background with inverted text.
+                label.set_style_bg_color(styles.lcd_color_fg, 0)
+                label.set_style_bg_opa(255, 0)
+                label.set_style_text_color(styles.lcd_color_bg, 0)
+            label.align(lvgl.ALIGN.TOP_LEFT, 0, y)
+            self._chan_labels.append(label)
+            y += self.LIST_ROW_PX
 
     def _build_channel_view(self):
         cid = self.active_channel_id
@@ -225,16 +254,23 @@ class MeshcoreApp(BaseApp):
         self.page.replace_screen()
 
     def _refresh_channel_view(self):
-        """Re-populate the message table only when the message count changed."""
+        """Re-populate the message table only when the message count changed.
+
+        Each row is rendered as: time (HH:MM) | "sender: text"."""
         msgs = self.channels.get(self.active_channel_id)
         count = len(msgs) if msgs else 0
         if count == self._view_msg_count:
             return
         self._view_msg_count = count
+        if not msgs:
+            self.page.populate_message_rows([("", "No messages yet on this channel.")])
+            return
         display = []
-        if msgs:
-            for m in msgs:
-                display.append((m.sender or "?", m.text))
+        for m in msgs:
+            t = time.localtime(m.recv_time)
+            time_str = "{:02d}:{:02d}".format(t[3], t[4])
+            who = m.sender or "?"
+            display.append((time_str, "{}: {}".format(who, m.text)))
         self.page.populate_message_rows(display)
 
     def _name_for(self, channel_id):
@@ -268,10 +304,10 @@ class MeshcoreApp(BaseApp):
         key = self.badge.keyboard.read_key()
         if key == self.badge.keyboard.UP:
             self.channel_sel = max(0, self.channel_sel - 1)
-            self._render_channel_selection()
+            self._draw_channel_list()
         elif key == self.badge.keyboard.DOWN:
             self.channel_sel = min(len(self._channel_order) - 1, self.channel_sel + 1)
-            self._render_channel_selection()
+            self._draw_channel_list()
 
         if self.badge.keyboard.f1():  # Open selected channel
             self.active_channel_id = self._channel_order[self.channel_sel][0]
