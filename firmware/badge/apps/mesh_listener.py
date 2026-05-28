@@ -6,40 +6,17 @@ import time
 import hashlib
 import hmac
 import struct
+import ucryptolib as cryptolib
 from apps.base_app import BaseApp
 from net.net import register_raw_receiver, unregister_raw_receiver
+from ui import styles
 
 APP_NAME = "MeshCore"
 
-# AES-ECB Decryption helper: Try MicroPython's native ucryptolib/cryptolib, fallback to CPython's cryptography
-AES_AVAILABLE = False
 def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
-    raise NotImplementedError("No AES implementation available")
-
-try:
-    import ucryptolib as cryptolib
-    AES_AVAILABLE = True
-    def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
-        # ucryptolib.aes expects 16, 24, or 32 byte keys. Mode 1 is ECB.
-        cipher = cryptolib.aes(key[:16], 1)
-        return cipher.decrypt(ciphertext)
-except ImportError:
-    try:
-        import cryptolib
-        AES_AVAILABLE = True
-        def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
-            cipher = cryptolib.aes(key[:16], 1)
-            return cipher.decrypt(ciphertext)
-    except ImportError:
-        try:
-            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-            AES_AVAILABLE = True
-            def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
-                cipher = Cipher(algorithms.AES(key[:16]), modes.ECB())
-                decryptor = cipher.decryptor()
-                return decryptor.update(ciphertext) + decryptor.finalize()
-        except ImportError:
-            pass
+    # ucryptolib.aes expects 16, 24, or 32 byte keys. Mode 1 is ECB.
+    cipher = cryptolib.aes(key[:16], 1)
+    return cipher.decrypt(ciphertext)
 
 # Known symmetric keys for group channels
 GROUP_KEYS = {
@@ -177,10 +154,6 @@ class MeshCoreListener(BaseApp):
                     print(f"[Decrypt Debug] MAC mismatch for {room_name}")
                     continue
                     
-                # Decrypt AES-128 ECB using our helper
-                if not AES_AVAILABLE:
-                    print(f"[Decrypt Debug] AES decryption unavailable for {room_name}")
-                    continue
                 plaintext = decrypt_aes_ecb(shared_secret[:16], ciphertext)
                 
                 # plaintext format: [timestamp:4][flags:1][sender_name: message]
@@ -300,16 +273,30 @@ class MeshCoreListener(BaseApp):
         self.last_parsed_timestamp = None  # Force a clean redraw on load
         super().switch_to_foreground()
         self.badge.display.clear()
+        self.badge.display.screen.set_style_bg_color(styles.lvg_color_black, 0)
         
-        # Create Title
-        self.title_label = self.badge.display.text(0, 0, "MeshCore Listener", color=0x00FF00) # Green title
+        # Create Title in legendary Matrix Green
+        self.title_label = self.badge.display.text(0, 0, "MeshCore Listener", color=0x39FF14) 
         self.badge.display.f5("Home")
         
-        # Pre-create labels
+        # Pre-create labels with dynamic Matrix terminal shades
         self.labels = []
         char_height = self.badge.display.CHAR_HEIGHT
+        
+        # Matrix phosphor shades: bright active green down to deep background glow
+        matrix_greens = [
+            0x00DD00,  # Line 0: Analyzer Header (Mid Neon Green)
+            0x00BB00,  # Line 1: RF State (Medium Terminal Green)
+            0x00FF00,  # Line 2: Protocol Type (Bright Green)
+            0x00CC00,  # Line 3: Hops/Topology (Classic Green)
+            0x39FF14,  # Line 4: Decrypted Message / Payload Decode (Super Bright Neon!)
+            0x008800,  # Line 5: Payload Hex Chunk (Dimmer Green)
+            0x005500,  # Line 6: Raw Hex Part 1 (Deep Phosphor Glow)
+            0x003300,  # Line 7: Raw Hex Part 2 (Shadow Phosphor Glow)
+        ]
+        
         for i in range(8):
-            lbl = self.badge.display.text((i + 1) * char_height, 0, "")
+            lbl = self.badge.display.text((i + 1) * char_height, 0, "", color=matrix_greens[i])
             self.labels.append(lbl)
             
         self.draw_packets()
