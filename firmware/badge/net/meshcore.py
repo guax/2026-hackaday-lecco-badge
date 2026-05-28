@@ -4,12 +4,56 @@ import struct
 import binascii
 import ucryptolib as cryptolib
 
-# Known symmetric keys for group channels
-GROUP_KEYS = {
-    "#public": "8b3387e9c5cdea6ac9e5edbaa115cd72",
-    "#test": hashlib.sha256(b"#test").digest()[:16].hex(),
-    "#grolli": hashlib.sha256(b"#grolli").digest()[:16].hex(),
+# The well-known MeshCore public channel key (always available; protected).
+PUBLIC_KEY = "8b3387e9c5cdea6ac9e5edbaa115cd72"
+PUBLIC_NAME = "#public"
+
+
+def derive_channel_key(name):
+    """Derive a MeshCore channel key from its name: sha256(name)[:16] as hex.
+
+    This is how '#'-style public channels (other than the well-known '#public')
+    obtain their key."""
+    return hashlib.sha256(name.encode()).digest()[:16].hex()
+
+
+# A channel's identity is its 16-byte symmetric key (hex string); names are
+# display-only and may collide, so everything is keyed by key_hex -> name.
+# These are seeded into persistent storage on first run.
+DEFAULT_CHANNELS = {
+    PUBLIC_KEY: PUBLIC_NAME,
+    derive_channel_key("#test"): "#test",
+    derive_channel_key("#hackaday"): "#hackaday",
 }
+
+# Working set of known channels (key_hex -> name), used by the decoder.
+# Populated from persistent storage at app start via set_channels(); defaults
+# apply until then (and for IDE/testing without a badge filesystem).
+CHANNELS = dict(DEFAULT_CHANNELS)
+
+
+def set_channels(mapping):
+    """Replace the working channel set in place (key_hex -> name) so existing
+    `CHANNELS` references (e.g. in apps) stay valid. Ensures #public is present."""
+    CHANNELS.clear()
+    CHANNELS.update(mapping)
+    if PUBLIC_KEY not in CHANNELS:
+        CHANNELS[PUBLIC_KEY] = PUBLIC_NAME
+
+
+def add_group_channel(key_hex, name):
+    """Register a channel by its key (32 hex chars) with a display name.
+
+    Returns True if added, False if the key already exists (no overwrite)."""
+    if key_hex in CHANNELS:
+        return False
+    CHANNELS[key_hex] = name
+    return True
+
+
+def remove_group_channel(key_hex):
+    """Remove a channel by its key. Returns the removed name, or None."""
+    return CHANNELS.pop(key_hex, None)
 
 def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
     # ucryptolib.aes expects 16, 24, or 32 byte keys. Mode 1 is ECB.
@@ -27,7 +71,7 @@ def try_decrypt_group_text(payload_bytes):
     - text:       the decoded message body
     - timestamp:  the 4-byte little-endian unix timestamp embedded in the message
     """
-    for room_name, key_hex in GROUP_KEYS.items():
+    for key_hex, room_name in CHANNELS.items():
         try:
             channel_key = bytes.fromhex(key_hex)
             

@@ -49,6 +49,12 @@ class DataFile:
     def get(self, key: str, default: bytes | None = None) -> bytes | None:
         return self.db.get(key, default)
 
+    def delete(self, key: str) -> None:
+        try:
+            del self.db[key]
+        except KeyError:
+            pass
+
     def close(self):
         self.db.close()
         self.file.close()
