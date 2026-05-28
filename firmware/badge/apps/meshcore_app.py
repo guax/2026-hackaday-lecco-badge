@@ -10,7 +10,7 @@ from ui import styles
 
 APP_NAME = "MeshCore"
 
-class MeshCoreListener(BaseApp):
+class MeshcoreApp(BaseApp):
     def __init__(self, name: str, badge):
         super().__init__(name, badge)
         self.packet_queue = deque([], 10)  # Store last 10 raw packet frames and RSSI/SNR
