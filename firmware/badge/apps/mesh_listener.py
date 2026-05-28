@@ -3,10 +3,50 @@
 from collections import deque
 import binascii
 import time
+import hashlib
+import hmac
+import struct
 from apps.base_app import BaseApp
 from net.net import register_raw_receiver, unregister_raw_receiver
 
 APP_NAME = "MeshCore"
+
+# AES-ECB Decryption helper: Try MicroPython's native ucryptolib/cryptolib, fallback to CPython's cryptography
+AES_AVAILABLE = False
+def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
+    raise NotImplementedError("No AES implementation available")
+
+try:
+    import ucryptolib as cryptolib
+    AES_AVAILABLE = True
+    def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
+        # ucryptolib.aes expects 16, 24, or 32 byte keys. Mode 1 is ECB.
+        cipher = cryptolib.aes(key[:16], 1)
+        return cipher.decrypt(ciphertext)
+except ImportError:
+    try:
+        import cryptolib
+        AES_AVAILABLE = True
+        def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
+            cipher = cryptolib.aes(key[:16], 1)
+            return cipher.decrypt(ciphertext)
+    except ImportError:
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            AES_AVAILABLE = True
+            def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
+                cipher = Cipher(algorithms.AES(key[:16]), modes.ECB())
+                decryptor = cipher.decryptor()
+                return decryptor.update(ciphertext) + decryptor.finalize()
+        except ImportError:
+            pass
+
+# Known symmetric keys for group channels
+GROUP_KEYS = {
+    "#public": "8b3387e9c5cdea6ac9e5edbaa115cd72",
+    "#test": hashlib.sha256(b"#test").digest()[:16].hex(),
+    "#grolli": hashlib.sha256(b"#grolli").digest()[:16].hex(),
+}
 
 class MeshCoreListener(BaseApp):
     def __init__(self, name: str, badge):
@@ -106,6 +146,61 @@ class MeshCoreListener(BaseApp):
         print(f"[MeshCore Debug] Parsed OK: Route={route}, MsgType={payload}, Hops={hop_count}, HashSize={parsed_hash_size}B, PayloadSize={len(payload_bytes)}B")
         return route, payload, hop_count, parsed_hash_size, path_data, payload_bytes
 
+    def try_decrypt_group_text(self, payload_bytes):
+        """Attempt to decrypt a group text message payload using known keys."""
+        for room_name, key_hex in GROUP_KEYS.items():
+            try:
+                channel_key = bytes.fromhex(key_hex)
+                
+                # Compute expected channel hash (always exactly 1 byte in MeshCore)
+                expected_hash = hashlib.sha256(channel_key).digest()[:1]
+                
+                # Extract channel hash from payload (always exactly 1 byte)
+                actual_hash = payload_bytes[:1]
+                if actual_hash != expected_hash:
+                    continue  # This key does not match the channel hash of the packet
+                    
+                # MAC is always 2 bytes in MeshCore, placed right after the 1-byte channel hash
+                mac_idx = 1
+                cipher_idx = mac_idx + 2
+                
+                if len(payload_bytes) < cipher_idx:
+                    continue
+                    
+                mac = payload_bytes[mac_idx:cipher_idx]
+                ciphertext = payload_bytes[cipher_idx:]
+                
+                # Verify MAC using standard hmac (pad shared secret to 32 bytes)
+                shared_secret = channel_key + b'\x00' * (32 - len(channel_key))
+                expected_mac = hmac.new(shared_secret, ciphertext, hashlib.sha256).digest()[:2]
+                if mac != expected_mac:
+                    print(f"[Decrypt Debug] MAC mismatch for {room_name}")
+                    continue
+                    
+                # Decrypt AES-128 ECB using our helper
+                if not AES_AVAILABLE:
+                    print(f"[Decrypt Debug] AES decryption unavailable for {room_name}")
+                    continue
+                plaintext = decrypt_aes_ecb(shared_secret[:16], ciphertext)
+                
+                # plaintext format: [timestamp:4][flags:1][sender_name: message]
+                if len(plaintext) < 5:
+                    continue
+                    
+                msg_bytes = plaintext[5:].rstrip(b'\x00')
+                message = msg_bytes.decode('utf-8')
+                print(f"[MeshCore Decrypt] Successfully decrypted {room_name}: {message}")
+                return room_name, message
+            except Exception as e:
+                import sys
+                print(f"[Decrypt Debug] Error decrypting with key for {room_name}: {e}")
+                if hasattr(sys, "print_exception"):
+                    sys.print_exception(e)
+                else:
+                    import traceback
+                    traceback.print_exc()
+        return None
+
     def run_foreground(self):
         if self.badge.keyboard.f5():  # Go back to Main Menu
             self.badge.display.clear()
@@ -172,10 +267,14 @@ class MeshCoreListener(BaseApp):
                         details += f" Name: '{printable}'"
             elif payload == "ACK" and len(payload_bytes) >= 4:
                 details = f"Ack CRC: {binascii.hexlify(payload_bytes[:4]).decode()}"
-            elif payload in ("GRP_TXT", "GRP_DAT") and len(payload_bytes) >= parsed_hash_size:
-                chan_bytes = payload_bytes[0 : parsed_hash_size]
+            elif payload in ("GRP_TXT", "GRP_DAT") and len(payload_bytes) >= 1:
+                chan_bytes = payload_bytes[0 : 1]
                 chan = binascii.hexlify(chan_bytes).decode()
-                details = f"Group Text on Chan: {chan}"
+                details = f"Group Chan: {chan}"
+                decrypted = self.try_decrypt_group_text(payload_bytes)
+                if decrypted:
+                    room_name, decoded_msg = decrypted
+                    details += f" ({room_name}): '{decoded_msg}'"
                 
             self.labels[4].set_text(f"Decoded:   {details}")
             
