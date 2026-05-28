@@ -1,14 +1,22 @@
 """MeshCore listening and packet decoding application."""
 
 from collections import deque, namedtuple
-import binascii
+import lvgl
 import time
 from apps.base_app import BaseApp
 from net.net import register_raw_receiver, unregister_raw_receiver
-from net.meshcore import parse_meshcore_packet, try_decrypt_group_text
+from net.meshcore import parse_meshcore_packet, try_decrypt_group_text, GROUP_KEYS
 from ui import styles
+from ui.page import Page
 
 APP_NAME = "MeshCore"
+
+# Application modes. MENU is the landing screen reached via F4.
+MODE_MENU = 0
+MODE_CHANNELS = 1
+MODE_CHANNEL_VIEW = 2
+MODE_DM = 3
+MODE_ANALYSER = 4
 
 # A single decoded channel message held in memory for later display.
 ChannelMessage = namedtuple(
@@ -27,10 +35,18 @@ class MeshcoreApp(BaseApp):
         # Display names for each channel_id, for UI / user organization only.
         self.channel_names = {}
         self.channel_buffer_len = 50
-        self.labels = []
-        self.foreground_sleep_ms = 200
+        self.foreground_sleep_ms = 50
         self.background_sleep_ms = 500
-        self.last_parsed_timestamp = None
+        # UI state
+        self.page = None
+        self.mode = MODE_MENU
+        # Channels list state: ordered list of (channel_id, name) and the selection cursor.
+        self._channel_order = []
+        self._channel_rows_cache = []
+        self.channel_sel = 0
+        # Channel view state
+        self.active_channel_id = None
+        self._view_msg_count = -1
 
     def start(self):
         super().start()
@@ -71,134 +87,214 @@ class MeshcoreApp(BaseApp):
             f"Known channels: {list(self.channel_names.values())}"
         )
 
+    # ------------------------------------------------------------------
+    # App lifecycle
+    # ------------------------------------------------------------------
+    def switch_to_foreground(self):
+        super().switch_to_foreground()
+        self._set_mode(MODE_MENU)
+
+    def switch_to_background(self):
+        self.page = None
+        super().switch_to_background()
+
     def run_foreground(self):
-        if self.badge.keyboard.f5():  # Go back to Main Menu
+        # F5 always returns to the main badge menu.
+        if self.badge.keyboard.f5():
             self.badge.display.clear()
             self.switch_to_background()
             return
 
-        # Update the UI labels
-        self.draw_packets()
-
-    def draw_packets(self):
-        # Clear screen labels or show detailed packet breakdown
-        if not self.packet_queue:
-            self.labels[0].set_text("Waiting for MeshCore packets...")
-            for i in range(1, 8):
-                self.labels[i].set_text("")
+        # F4 always returns to the MeshCore main menu.
+        if self.badge.keyboard.f4():
+            self._set_mode(MODE_MENU)
             return
 
-        timestamp, frame, rssi, snr = self.packet_queue[-1]  # Analyze the absolute latest packet
-        
-        # Avoid constant parsing and screen drawing if the frame hasn't changed
-        if timestamp == self.last_parsed_timestamp:
+        # Dispatch contextual input to the active mode.
+        if self.mode == MODE_MENU:
+            self._run_menu()
+        elif self.mode == MODE_CHANNELS:
+            self._run_channels()
+        elif self.mode == MODE_CHANNEL_VIEW:
+            self._run_channel_view()
+        elif self.mode == MODE_DM:
+            self._run_dm()
+        elif self.mode == MODE_ANALYSER:
+            self._run_analyser()
+
+    # ------------------------------------------------------------------
+    # Mode switching / screen building
+    # ------------------------------------------------------------------
+    def _set_mode(self, mode):
+        self.mode = mode
+        if mode == MODE_MENU:
+            self._build_menu()
+        elif mode == MODE_CHANNELS:
+            self._build_channels()
+        elif mode == MODE_CHANNEL_VIEW:
+            self._build_channel_view()
+        elif mode == MODE_DM:
+            self._build_placeholder("Direct Messages", "DM mode coming soon.")
+        elif mode == MODE_ANALYSER:
+            self._build_placeholder("Packet Analyser", "Packet analyser coming soon.")
+
+    def _content_label(self, text):
+        """Create a left-aligned multiline label inside the current page content."""
+        label = lvgl.label(self.page.content)
+        label.add_style(styles.content_style, 0)
+        label.set_width(lvgl.pct(96))
+        label.align(lvgl.ALIGN.TOP_LEFT, 8, 6)
+        label.set_text(text)
+        return label
+
+    def _build_menu(self):
+        self.page = Page()
+        self.page.create_infobar(["MeshCore", "Main Menu"])
+        self.page.create_content()
+        self._content_label(
+            "Select a mode:\n"
+            "F1  Channels  - browse decoded channel messages\n"
+            "F2  Direct Msg - send/read direct messages\n"
+            "F3  Packets    - raw packet analyser"
+        )
+        self.page.create_menubar(["Channels", "Direct", "Packets", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _refresh_channel_order(self):
+        """Build the ordered list of channels: every configured channel, plus any
+        channel we have received messages for that isn't in the config."""
+        order = [(key_hex, name) for name, key_hex in GROUP_KEYS.items()]
+        order.sort(key=lambda c: c[1])
+        known = set(cid for cid, _ in order)
+        for cid in self.channels:
+            if cid not in known:
+                order.append((cid, self.channel_names.get(cid, cid[:8])))
+        self._channel_order = order
+        if self.channel_sel >= len(order):
+            self.channel_sel = max(0, len(order) - 1)
+
+    def _channel_rows(self):
+        rows = []
+        for cid, name in self._channel_order:
+            count = len(self.channels.get(cid, ()))
+            rows.append((name, "{} msg".format(count)))
+        return rows
+
+    def _build_channels(self):
+        self._refresh_channel_order()
+        self.page = Page()
+        self.page.create_infobar(["Channels", "Up/Dn select"])
+        self.page.create_content()
+        rows = self._channel_rows()
+        self.page.add_message_rows(max(1, len(rows)), left_width=300)
+        self._populate_channel_list(rows)
+        self.page.create_menubar(["Open", "Add", "Del", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _populate_channel_list(self, rows):
+        table = self.page.message_rows
+        if not rows:
+            table.set_row_count(1)
+            table.set_cell_value(0, 0, "(no channels configured)")
+            table.set_cell_value(0, 1, "")
             return
-            
-        self.last_parsed_timestamp = timestamp
+        table.set_row_count(len(rows))
+        self._channel_rows_cache = rows
+        self._render_channel_selection()
 
-        t_struct = time.localtime(timestamp)
-        time_str = f"{t_struct[3]:02d}:{t_struct[4]:02d}:{t_struct[5]:02d}"
+    def _render_channel_selection(self):
+        """Draw a '>' marker on the selected row so the cursor is clearly visible."""
+        table = self.page.message_rows
+        rows = self._channel_rows_cache
+        for i, (name, count) in enumerate(rows):
+            marker = "> " if i == self.channel_sel else "  "
+            table.set_cell_value(i, 0, marker + name)
+            table.set_cell_value(i, 1, count)
+        table.set_selected_cell(self.channel_sel, 0)
 
-        # Line 0: Header Section
-        self.labels[0].set_text(f"--- MeshCore Analyzer @ {time_str} ---")
+    def _build_channel_view(self):
+        cid = self.active_channel_id
+        name = self.channel_names.get(cid) or self._name_for(cid)
+        self.page = Page()
+        self.page.create_infobar(["Channel: {}".format(name), ""])
+        self.page.create_content()
+        self.page.add_message_rows(1, left_width=90)
+        self._view_msg_count = -1
+        self._refresh_channel_view()
+        self.page.create_menubar(["Back", "", "", "Menu", "Home"])
+        self.page.replace_screen()
 
-        # Line 1: RF State
-        self.labels[1].set_text(f"RF Signal: RSSI={int(rssi)}dBm | SNR={int(snr)}dB | Size={len(frame)}B")
+    def _refresh_channel_view(self):
+        """Re-populate the message table only when the message count changed."""
+        msgs = self.channels.get(self.active_channel_id)
+        count = len(msgs) if msgs else 0
+        if count == self._view_msg_count:
+            return
+        self._view_msg_count = count
+        display = []
+        if msgs:
+            for m in msgs:
+                display.append((m.sender or "?", m.text))
+        self.page.populate_message_rows(display)
 
-        # Parse MeshCore packet
-        parsed = parse_meshcore_packet(frame)
-        if parsed:
-            route, payload, hop_count, parsed_hash_size, path_data, payload_bytes = parsed
-            
-            # Line 2: Header info
-            self.labels[2].set_text(f"Protocol:  Route={route} | MsgType={payload}")
-            
-            # Line 3: Path / Hops
-            path_hex = binascii.hexlify(path_data).decode()
-            self.labels[3].set_text(f"Topology:  Hops={hop_count} (Hash={parsed_hash_size}B) | Path={path_hex}")
-            
-            # Line 4: Payload Decoded Info
-            details = "None"
-            if payload == "TXT" and len(payload_bytes) >= parsed_hash_size * 2:
-                dest_bytes = payload_bytes[0 : parsed_hash_size]
-                src_bytes = payload_bytes[parsed_hash_size : parsed_hash_size * 2]
-                dest = binascii.hexlify(dest_bytes).decode()
-                src = binascii.hexlify(src_bytes).decode()
-                details = f"Private Msg: {src} -> {dest}"
-            elif payload == "ADV" and len(payload_bytes) >= 32:
-                node_hash_bytes = payload_bytes[0 : parsed_hash_size]
-                node_hash = binascii.hexlify(node_hash_bytes).decode()
-                details = f"Advert Node: {node_hash}"
-                if len(payload_bytes) > 101:
-                    appdata = payload_bytes[101:]
-                    # Extract printable ASCII names
-                    printable = "".join([chr(b) for b in appdata if 32 <= b < 127]).strip()
-                    if len(printable) >= 2:
-                        details += f" Name: '{printable}'"
-            elif payload == "ACK" and len(payload_bytes) >= 4:
-                details = f"Ack CRC: {binascii.hexlify(payload_bytes[:4]).decode()}"
-            elif payload in ("GRP_TXT", "GRP_DAT") and len(payload_bytes) >= 1:
-                chan_bytes = payload_bytes[0 : 1]
-                chan = binascii.hexlify(chan_bytes).decode()
-                details = f"Group Chan: {chan}"
-                decrypted = try_decrypt_group_text(payload_bytes)
-                if decrypted:
-                    _chan_id, room_name, sender, decoded_msg, _ts = decrypted
-                    details += f" ({room_name}) {sender}: '{decoded_msg}'"
-                
-            self.labels[4].set_text(f"Decoded:   {details}")
-            
-            # Line 5: Payload Hex
-            pay_hex = binascii.hexlify(payload_bytes).decode()
-            display_pay = pay_hex[:45] + ".." if len(pay_hex) > 45 else pay_hex
-            self.labels[5].set_text(f"Payload:   {display_pay}")
-        else:
-            self.labels[2].set_text("Protocol:  Non-V1 or Invalid MeshCore Frame")
-            self.labels[3].set_text("")
-            self.labels[4].set_text("")
-            self.labels[5].set_text("")
+    def _name_for(self, channel_id):
+        for name, key_hex in GROUP_KEYS.items():
+            if key_hex == channel_id:
+                return name
+        return channel_id[:8]
 
-        # Line 6 & 7: Raw Hex Dump
-        raw_hex = binascii.hexlify(frame).decode()
-        self.labels[6].set_text(f"Raw Frame: {raw_hex[:45]}")
-        if len(raw_hex) > 45:
-            self.labels[7].set_text(f"           {raw_hex[45:]}")
-        else:
-            self.labels[7].set_text("")
+    def _build_placeholder(self, title, body):
+        self.page = Page()
+        self.page.create_infobar(["MeshCore", title])
+        self.page.create_content()
+        self._content_label(body)
+        self.page.create_menubar(["", "", "", "Menu", "Home"])
+        self.page.replace_screen()
 
-    def switch_to_foreground(self):
-        self.last_parsed_timestamp = None  # Force a clean redraw on load
-        super().switch_to_foreground()
-        self.badge.display.clear()
-        self.badge.display.screen.set_style_bg_color(styles.lvg_color_black, 0)
-        
-        # Create Title in legendary Matrix Green
-        self.title_label = self.badge.display.text(0, 0, "MeshCore Listener", color=0x39FF14) 
-        self.badge.display.f5("Home")
-        
-        # Pre-create labels with dynamic Matrix terminal shades
-        self.labels = []
-        char_height = self.badge.display.CHAR_HEIGHT
-        
-        # Matrix phosphor shades: bright active green down to deep background glow
-        matrix_greens = [
-            0x00DD00,  # Line 0: Analyzer Header (Mid Neon Green)
-            0x00BB00,  # Line 1: RF State (Medium Terminal Green)
-            0x00FF00,  # Line 2: Protocol Type (Bright Green)
-            0x00CC00,  # Line 3: Hops/Topology (Classic Green)
-            0x39FF14,  # Line 4: Decrypted Message / Payload Decode (Super Bright Neon!)
-            0x008800,  # Line 5: Payload Hex Chunk (Dimmer Green)
-            0x005500,  # Line 6: Raw Hex Part 1 (Deep Phosphor Glow)
-            0x003300,  # Line 7: Raw Hex Part 2 (Shadow Phosphor Glow)
-        ]
-        
-        for i in range(8):
-            lbl = self.badge.display.text((i + 1) * char_height, 0, "", color=matrix_greens[i])
-            self.labels.append(lbl)
-            
-        self.draw_packets()
+    # ------------------------------------------------------------------
+    # Per-mode input handling
+    # ------------------------------------------------------------------
+    def _run_menu(self):
+        if self.badge.keyboard.f1():
+            self._set_mode(MODE_CHANNELS)
+        elif self.badge.keyboard.f2():
+            self._set_mode(MODE_DM)
+        elif self.badge.keyboard.f3():
+            self._set_mode(MODE_ANALYSER)
 
-    def switch_to_background(self):
-        self.labels = []
-        self.title_label = None
-        super().switch_to_background()
+    def _run_channels(self):
+        if not self._channel_order:
+            return
+        key = self.badge.keyboard.read_key()
+        if key == self.badge.keyboard.UP:
+            self.channel_sel = max(0, self.channel_sel - 1)
+            self._render_channel_selection()
+        elif key == self.badge.keyboard.DOWN:
+            self.channel_sel = min(len(self._channel_order) - 1, self.channel_sel + 1)
+            self._render_channel_selection()
+
+        if self.badge.keyboard.f1():  # Open selected channel
+            self.active_channel_id = self._channel_order[self.channel_sel][0]
+            self._set_mode(MODE_CHANNEL_VIEW)
+        # F2 (Add) and F3 (Delete) are reserved for future channel management.
+
+    def _run_channel_view(self):
+        if self.badge.keyboard.f1():  # Back to channel list
+            self._set_mode(MODE_CHANNELS)
+            return
+        # Keep the view in sync as new messages arrive while open.
+        self._refresh_channel_view()
+        key = self.badge.keyboard.read_key()
+        scroll = 13
+        if self.badge.keyboard.shift_pressed:
+            scroll *= 5
+        if key == self.badge.keyboard.UP:
+            self.page.scroll_up(scroll)
+        elif key == self.badge.keyboard.DOWN:
+            self.page.scroll_down(scroll)
+
+    def _run_dm(self):
+        pass
+
+    def _run_analyser(self):
+        pass
