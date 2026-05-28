@@ -17,7 +17,16 @@ def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
     return cipher.decrypt(ciphertext)
 
 def try_decrypt_group_text(payload_bytes):
-    """Attempt to decrypt a group text message payload using known keys."""
+    """Attempt to decrypt a group text message payload using known keys.
+
+    Returns a tuple (channel_id, room_name, sender, text, timestamp) on success, or None.
+    - channel_id: the channel's symmetric key (hex string) - the stable identity of a
+                  channel in MeshCore. Names can collide, keys do not.
+    - room_name:  the human-friendly channel name for display (e.g. "#public")
+    - sender:     the sender name parsed from the plaintext ("" if none found)
+    - text:       the decoded message body
+    - timestamp:  the 4-byte little-endian unix timestamp embedded in the message
+    """
     for room_name, key_hex in GROUP_KEYS.items():
         try:
             channel_key = bytes.fromhex(key_hex)
@@ -52,11 +61,19 @@ def try_decrypt_group_text(payload_bytes):
             # plaintext format: [timestamp:4][flags:1][sender_name: message]
             if len(plaintext) < 5:
                 continue
-                
+
+            timestamp = struct.unpack("<I", plaintext[:4])[0]
             msg_bytes = plaintext[5:].rstrip(b'\x00')
             message = msg_bytes.decode('utf-8')
-            print(f"[MeshCore Decrypt] Successfully decrypted {room_name}: {message}")
-            return room_name, message
+
+            # MeshCore channel messages embed the sender as "sender: message"
+            if ": " in message:
+                sender, _, body = message.partition(": ")
+            else:
+                sender, body = "", message
+
+            print(f"[MeshCore Decrypt] {room_name} <{sender}>: {body}")
+            return key_hex, room_name, sender, body, timestamp
         except Exception as e:
             import sys
             print(f"[Decrypt Debug] Error decrypting with key for {room_name}: {e}")

@@ -1,6 +1,6 @@
 """MeshCore listening and packet decoding application."""
 
-from collections import deque
+from collections import deque, namedtuple
 import binascii
 import time
 from apps.base_app import BaseApp
@@ -10,10 +10,23 @@ from ui import styles
 
 APP_NAME = "MeshCore"
 
+# A single decoded channel message held in memory for later display.
+ChannelMessage = namedtuple(
+    "ChannelMessage", ["recv_time", "msg_time", "sender", "text", "rssi", "snr"]
+)
+
+
 class MeshcoreApp(BaseApp):
     def __init__(self, name: str, badge):
         super().__init__(name, badge)
         self.packet_queue = deque([], 10)  # Store last 10 raw packet frames and RSSI/SNR
+        # Decoded group-channel message history, keyed by channel_id (the channel's
+        # symmetric key in hex) since names can collide but keys are unique.
+        # Each value is a deque of ChannelMessage, newest last.
+        self.channels = {}
+        # Display names for each channel_id, for UI / user organization only.
+        self.channel_names = {}
+        self.channel_buffer_len = 50
         self.labels = []
         self.foreground_sleep_ms = 200
         self.background_sleep_ms = 500
@@ -27,8 +40,36 @@ class MeshcoreApp(BaseApp):
     def handle_raw_packet(self, frame):
         rssi = self.badge.lora.get_rssi()
         snr = self.badge.lora.get_snr()
+        recv_time = time.time()
         # Append tuple of (time, raw_frame_bytes, rssi, snr)
-        self.packet_queue.append((time.time(), frame, rssi, snr))
+        self.packet_queue.append((recv_time, frame, rssi, snr))
+        # Decode and persist group channel messages so they can be viewed later,
+        # even if this happens while the app is in the background.
+        self._store_group_message(frame, recv_time, rssi, snr)
+
+    def _store_group_message(self, frame, recv_time, rssi, snr):
+        """Parse a raw frame and, if it's a decodable group text, save it per-channel."""
+        parsed = parse_meshcore_packet(frame)
+        if not parsed:
+            return
+        _route, payload, _hops, _hash_size, _path, payload_bytes = parsed
+        if payload not in ("GRP_TXT", "GRP_DAT"):
+            return
+        decrypted = try_decrypt_group_text(payload_bytes)
+        if not decrypted:
+            return
+        channel_id, room_name, sender, text, msg_time = decrypted
+        message = ChannelMessage(recv_time, msg_time, sender, text, rssi, snr)
+        channel = self.channels.get(channel_id)
+        if channel is None:
+            channel = deque([], self.channel_buffer_len)
+            self.channels[channel_id] = channel
+        self.channel_names[channel_id] = room_name
+        channel.append(message)
+        print(
+            f"[MeshCore] Stored '{room_name}' msg (channel now has {len(channel)}). "
+            f"Known channels: {list(self.channel_names.values())}"
+        )
 
     def run_foreground(self):
         if self.badge.keyboard.f5():  # Go back to Main Menu
@@ -102,8 +143,8 @@ class MeshcoreApp(BaseApp):
                 details = f"Group Chan: {chan}"
                 decrypted = try_decrypt_group_text(payload_bytes)
                 if decrypted:
-                    room_name, decoded_msg = decrypted
-                    details += f" ({room_name}): '{decoded_msg}'"
+                    _chan_id, room_name, sender, decoded_msg, _ts = decrypted
+                    details += f" ({room_name}) {sender}: '{decoded_msg}'"
                 
             self.labels[4].set_text(f"Decoded:   {details}")
             
