@@ -1,6 +1,8 @@
 """MeshCore listening and packet decoding application."""
 
 from collections import deque, namedtuple
+import asyncio as aio
+import binascii
 import lvgl
 import time
 from apps.base_app import BaseApp
@@ -17,11 +19,20 @@ from net.meshcore import (
     add_group_channel,
     remove_group_channel,
 )
+from net.meshcore_packets import (
+    MeshCorePacketBuilder,
+    generate_private_key,
+    load_private_key,
+    public_key_to_raw,
+    private_key_to_raw,
+)
 from ui import styles
 from ui.page import Page
 
 # Persistent store (separate from the main badge config) holding user channels.
 CHANNEL_STORE_NAME = "meshcore_channels"
+# Persistent store holding this node's Ed25519 identity (raw private key seed).
+IDENTITY_STORE_NAME = "meshcore_identity"
 
 APP_NAME = "MeshCore"
 
@@ -32,7 +43,7 @@ MODE_CHANNEL_VIEW = 2
 MODE_CHANNEL_ADD = 3
 MODE_CHANNEL_DELETE = 4
 MODE_DM = 5
-MODE_ANALYSER = 6
+MODE_ADVERT = 6
 
 # Built-in channels that may not be deleted, identified by their key (hex).
 PROTECTED_CHANNELS = (PUBLIC_KEY,)
@@ -41,7 +52,6 @@ PROTECTED_CHANNELS = (PUBLIC_KEY,)
 ChannelMessage = namedtuple(
     "ChannelMessage", ["recv_time", "msg_time", "sender", "text", "rssi", "snr"]
 )
-
 
 class MeshcoreApp(BaseApp):
     def __init__(self, name: str, badge):
@@ -72,13 +82,67 @@ class MeshcoreApp(BaseApp):
         self.add_name = ""
         # Persistent channel store (separate /data file, not the main config).
         self.channel_store = None
+        # Node identity / packet builder, loaded at start.
+        self.identity_store = None
+        self.packet_builder = None
+        # Info about the most recently sent advert, for display.
+        self.last_advert = None
 
     def start(self):
         super().start()
         # Load persisted channels into the decoder before listening starts.
         self._load_channels()
+        # Load (or create) this node's Ed25519 identity and packet builder.
+        self._load_identity()
         # Register the raw packet receiver callback
         register_raw_receiver(self.handle_raw_packet)
+
+    def _node_name(self):
+        """Display name for this node, taken from the badge alias if set."""
+        try:
+            alias = self.badge.config.get("nametag")
+            if alias:
+                alias = alias.decode() if isinstance(alias, (bytes, bytearray)) else str(alias)
+                alias = alias.strip()
+                if alias:
+                    return alias[:32]
+        except Exception as e: 
+            print(f"[MeshCore] Error getting node name: {e}")
+            pass
+        return "Hackbadge"
+
+    def _load_identity(self):
+        """Load the node's Ed25519 keypair from storage, generating and
+        persisting a new one on first run, then build the packet builder."""
+        try:
+            self.identity_store = DataFile(IDENTITY_STORE_NAME)
+            raw = self.identity_store.get("priv")
+            if raw:
+                priv = load_private_key(bytes(raw))
+            else:
+                priv = generate_private_key()
+                self.identity_store.set("priv", private_key_to_raw(priv))
+                self.identity_store.flush()
+                print("[MeshCore] Generated new node identity")
+            pub_raw = public_key_to_raw(priv)
+            self.packet_builder = MeshCorePacketBuilder(pub_raw, priv, self._node_name())
+            print("[MeshCore] Node '{}' pubkey={}".format(
+                self.packet_builder.node_name, binascii.hexlify(pub_raw).decode()))
+        except Exception as e:
+            import sys
+            print("[MeshCore] Identity load failed:", e)
+            sys.print_exception(e)
+            self.packet_builder = None
+
+    def _transmit(self, packet):
+        """Schedule a raw packet for transmission over LoRa (bypasses BadgeNet
+        framing). run_foreground is sync, so the async send is fired as a task."""
+        try:
+            aio.create_task(self.badge.lora.send(packet))
+            return True
+        except Exception as e:
+            print("[MeshCore] TX schedule error:", e)
+            return False
 
     def _load_channels(self):
         """Open the channel store, seeding defaults on first run, and apply the
@@ -175,8 +239,8 @@ class MeshcoreApp(BaseApp):
             self._run_channel_delete()
         elif self.mode == MODE_DM:
             self._run_dm()
-        elif self.mode == MODE_ANALYSER:
-            self._run_analyser()
+        elif self.mode == MODE_ADVERT:
+            self._run_advert()
 
     # ------------------------------------------------------------------
     # Mode switching / screen building
@@ -198,8 +262,8 @@ class MeshcoreApp(BaseApp):
             self._build_channel_delete()
         elif mode == MODE_DM:
             self._build_placeholder("Direct Messages", "DM mode coming soon.")
-        elif mode == MODE_ANALYSER:
-            self._build_placeholder("Packet Analyser", "Packet analyser coming soon.")
+        elif mode == MODE_ADVERT:
+            self._build_advert()
 
     def _content_label(self, text):
         """Create a left-aligned multiline label inside the current page content."""
@@ -218,9 +282,9 @@ class MeshcoreApp(BaseApp):
             "Select a mode:\n"
             "F1  Channels  - browse decoded channel messages\n"
             "F2  Direct Msg - send/read direct messages\n"
-            "F3  Packets    - raw packet analyser"
+            "F3  Advert     - broadcast this node's identity"
         )
-        self.page.create_menubar(["Channels", "Direct", "Packets", "Menu", "Home"])
+        self.page.create_menubar(["Channels", "Direct", "Advert", "Menu", "Home"])
         self.page.replace_screen()
 
     def _refresh_channel_order(self):
@@ -464,7 +528,7 @@ class MeshcoreApp(BaseApp):
         elif self.badge.keyboard.f2():
             self._set_mode(MODE_DM)
         elif self.badge.keyboard.f3():
-            self._set_mode(MODE_ANALYSER)
+            self._set_mode(MODE_ADVERT)
 
     def _run_channels(self):
         if not self._channel_order:
@@ -550,5 +614,60 @@ class MeshcoreApp(BaseApp):
     def _run_dm(self):
         pass
 
-    def _run_analyser(self):
-        pass
+    # ------------------------------------------------------------------
+    # Advert flow
+    # ------------------------------------------------------------------
+    def _build_advert(self):
+        self.page = Page()
+        self.page.create_infobar(["Advert", ""])
+        self.page.create_content()
+        if not self.packet_builder:
+            self._content_label(
+                "Node identity unavailable.\nCannot build adverts."
+            )
+            self.page.create_menubar(["", "", "", "Menu", "Home"])
+            self.page.replace_screen()
+            return
+        pub_hex = binascii.hexlify(self.packet_builder.public_key).decode()
+        lines = [
+            "Node: {}".format(self.packet_builder.node_name),
+            "Key:  {}...".format(pub_hex[:24]),
+            "",
+        ]
+        if self.last_advert:
+            lines.append("Last: {}".format(self.last_advert["route"]))
+            lines.append("  ts={}  len={}B".format(
+                self.last_advert["ts"], self.last_advert["len"]))
+            lines.append("  {}".format(self.last_advert["hex"]))
+        else:
+            lines.append("F1 Direct    F2 Flood")
+        self._content_label("\n".join(lines))
+        self.page.create_menubar(["Direct", "Flood", "", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _run_advert(self):
+        if not self.packet_builder:
+            return
+        if self.badge.keyboard.f1():
+            self._send_advert(MeshCorePacketBuilder.ROUTE_DIRECT, "Direct")
+        elif self.badge.keyboard.f2():
+            self._send_advert(MeshCorePacketBuilder.ROUTE_FLOOD, "Flood")
+
+    def _send_advert(self, route_type, label):
+        ts = int(time.time())
+        try:
+            packet = self.packet_builder.build_advert(route_type=route_type, timestamp=ts)
+        except Exception as e:
+            print("[MeshCore] Advert build failed:", e)
+            self.page.infobar_right.set_text("Build error")
+            return
+        ok = self._transmit(packet)
+        hexstr = binascii.hexlify(packet).decode()
+        self.last_advert = {
+            "route": "{} {}".format(label, "sent" if ok else "FAILED"),
+            "ts": ts,
+            "len": len(packet),
+            "hex": hexstr[:48] + ("..." if len(hexstr) > 48 else ""),
+        }
+        print("[MeshCore] Advert ({}) {}B: {}".format(label, len(packet), hexstr))
+        self._build_advert()

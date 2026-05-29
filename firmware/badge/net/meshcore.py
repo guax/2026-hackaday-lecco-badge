@@ -8,7 +8,6 @@ import ucryptolib as cryptolib
 PUBLIC_KEY = "8b3387e9c5cdea6ac9e5edbaa115cd72"
 PUBLIC_NAME = "#public"
 
-
 def derive_channel_key(name):
     """Derive a MeshCore channel key from its name: sha256(name)[:16] as hex.
 
@@ -30,7 +29,6 @@ DEFAULT_CHANNELS = {
 # Populated from persistent storage at app start via set_channels(); defaults
 # apply until then (and for IDE/testing without a badge filesystem).
 CHANNELS = dict(DEFAULT_CHANNELS)
-
 
 def set_channels(mapping):
     """Replace the working channel set in place (key_hex -> name) so existing
