@@ -3,6 +3,7 @@
 from collections import deque, namedtuple
 import asyncio as aio
 import binascii
+from struct import pack
 import lvgl
 import time
 from apps.base_app import BaseApp
@@ -35,6 +36,8 @@ CHANNEL_STORE_NAME = "meshcore_channels"
 IDENTITY_STORE_NAME = "meshcore_identity"
 
 APP_NAME = "MeshCore"
+
+MAX_MESSAGE_LEN = 130
 
 # Application modes. MENU is the landing screen reached via F4.
 MODE_MENU = 0
@@ -75,6 +78,7 @@ class MeshcoreApp(BaseApp):
         self.channel_sel = 0
         # Channel view state
         self.active_channel_id = None
+        self.compose_active = False
         self._view_msg_count = -1
         # Add-channel flow state
         self.add_step = "type"   # "type" -> "name" -> "key"
@@ -87,6 +91,8 @@ class MeshcoreApp(BaseApp):
         self.packet_builder = None
         # Info about the most recently sent advert, for display.
         self.last_advert = None
+        # Some singletons
+        self.node_name = None
 
     def start(self):
         super().start()
@@ -99,13 +105,16 @@ class MeshcoreApp(BaseApp):
 
     def _node_name(self):
         """Display name for this node, taken from the badge alias if set."""
+        if self.node_name:
+            return self.node_name
         try:
             alias = self.badge.config.get("nametag")
             if alias:
                 alias = alias.decode() if isinstance(alias, (bytes, bytearray)) else str(alias)
                 alias = alias.strip()
                 if alias:
-                    return alias[:32]
+                    self.node_name = alias[:32]
+                    return self.node_name
         except Exception as e: 
             print(f"[MeshCore] Error getting node name: {e}")
             pass
@@ -377,7 +386,7 @@ class MeshcoreApp(BaseApp):
         self.page.add_message_rows(1, left_width=90)
         self._view_msg_count = -1
         self._refresh_channel_view()
-        self.page.create_menubar(["Back", "", "", "Menu", "Home"])
+        self.page.create_menubar(["Transmit", "", "Back", "Menu", "Home"])
         self.page.replace_screen()
 
     def _refresh_channel_view(self):
@@ -550,7 +559,24 @@ class MeshcoreApp(BaseApp):
             self._set_mode(MODE_CHANNEL_DELETE)
 
     def _run_channel_view(self):
-        if self.badge.keyboard.f1():  # Back to channel list
+        if not self.compose_active and self.badge.keyboard.f1():  # Compose a message
+            self.page.create_text_box()
+            self.compose_active = True
+        
+        if self.compose_active:
+            key, text = self.page.text_box_type(self.badge.keyboard)
+            self.page.infobar_right.set_text(f"{len(text)}/{MAX_MESSAGE_LEN}  F1 to send")
+            if self.badge.keyboard.escape_pressed:
+                self.page.close_text_box()
+                self.compose_active = False
+            if self.badge.keyboard.f1():  # Send
+                if self.page.text_box.get_text():
+                    message_text = self.page.close_text_box()
+                    self._send_group_txt(message_text)
+                    self.compose_active = False
+            return
+
+        if self.badge.keyboard.f3():  # Back to channel list
             self._set_mode(MODE_CHANNELS)
             return
         # Keep the view in sync as new messages arrive while open.
@@ -563,6 +589,27 @@ class MeshcoreApp(BaseApp):
             self.page.scroll_up(scroll)
         elif key == self.badge.keyboard.DOWN:
             self.page.scroll_down(scroll)
+
+    def _send_group_txt(self, message):
+        try:
+            packet = self.packet_builder.build_group_txt(self.active_channel_id, message)
+        except Exception as e:
+            import sys
+            print("[MeshCore] Group TXT packet build failed:", e)
+            sys.print_exception(e)
+            self.page.infobar_right.set_text("Build error")
+            return
+        print("[MeshCore] Sending groupt text Packet:", packet.hex())
+        self._transmit(packet)
+
+        now = int(time.time())
+        messageObj = ChannelMessage(now, now, self._node_name(), message, 0, 0)
+        channel = self.channels.get(self.active_channel_id)
+        # If no message arrived channels is not initialized, this whole thing needs a good refactoring
+        if channel is None:
+            channel = deque([], self.channel_buffer_len)
+            self.channels[self.active_channel_id] = channel
+        channel.append(messageObj)
 
     def _run_channel_add(self):
         # Step 1: pick the channel type.
