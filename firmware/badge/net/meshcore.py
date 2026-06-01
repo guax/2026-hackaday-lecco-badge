@@ -6,12 +6,12 @@ import ucryptolib as cryptolib
 
 # The well-known MeshCore public channel key (always available; protected).
 PUBLIC_KEY = "8b3387e9c5cdea6ac9e5edbaa115cd72"
-PUBLIC_NAME = "#public"
+PUBLIC_NAME = "Public"
 
 def derive_channel_key(name):
     """Derive a MeshCore channel key from its name: sha256(name)[:16] as hex.
 
-    This is how '#'-style public channels (other than the well-known '#public')
+    This is how '#'-style public channels (other than the well-known 'Public')
     obtain their key."""
     return hashlib.sha256(name.encode()).digest()[:16].hex()
 
@@ -32,7 +32,7 @@ CHANNELS = dict(DEFAULT_CHANNELS)
 
 def set_channels(mapping):
     """Replace the working channel set in place (key_hex -> name) so existing
-    `CHANNELS` references (e.g. in apps) stay valid. Ensures #public is present."""
+    `CHANNELS` references (e.g. in apps) stay valid. Ensures Public is present."""
     CHANNELS.clear()
     CHANNELS.update(mapping)
     if PUBLIC_KEY not in CHANNELS:
@@ -64,7 +64,7 @@ def try_decrypt_group_text(payload_bytes):
     Returns a tuple (channel_id, room_name, sender, text, timestamp) on success, or None.
     - channel_id: the channel's symmetric key (hex string) - the stable identity of a
                   channel in MeshCore. Names can collide, keys do not.
-    - room_name:  the human-friendly channel name for display (e.g. "#public")
+    - room_name:  the human-friendly channel name for display (e.g. "#test")
     - sender:     the sender name parsed from the plaintext ("" if none found)
     - text:       the decoded message body
     - timestamp:  the 4-byte little-endian unix timestamp embedded in the message
