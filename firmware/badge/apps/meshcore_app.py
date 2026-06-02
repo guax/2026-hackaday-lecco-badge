@@ -3,29 +3,23 @@
 from collections import deque, namedtuple
 import asyncio as aio
 import binascii
-from struct import pack
 import lvgl
 import time
 from apps.base_app import BaseApp
 from hardware.datafile import DataFile
 from net.net import register_raw_receiver, unregister_raw_receiver
 from net.meshcore import (
-    parse_meshcore_packet,
-    try_decrypt_group_text,
-    CHANNELS,
+    Packet,
+    Advert,
+    GroupText,
+    Channel,
+    Identity,
     DEFAULT_CHANNELS,
     PUBLIC_KEY,
-    set_channels,
+    PayloadType,
+    RouteType,
     derive_channel_key,
-    add_group_channel,
-    remove_group_channel,
-)
-from net.meshcore_packets import (
-    MeshCorePacketBuilder,
-    generate_private_key,
-    load_private_key,
-    public_key_to_raw,
-    private_key_to_raw,
+    registry,
 )
 from ui import styles
 from ui.page import Page
@@ -88,7 +82,7 @@ class MeshcoreApp(BaseApp):
         self.channel_store = None
         # Node identity / packet builder, loaded at start.
         self.identity_store = None
-        self.packet_builder = None
+        self.identity = None
         # Info about the most recently sent advert, for display.
         self.last_advert = None
         # Some singletons
@@ -127,21 +121,19 @@ class MeshcoreApp(BaseApp):
             self.identity_store = DataFile(IDENTITY_STORE_NAME)
             raw = self.identity_store.get("priv")
             if raw:
-                priv = load_private_key(bytes(raw))
+                self.identity = Identity.load(bytes(raw), self._node_name())
             else:
-                priv = generate_private_key()
-                self.identity_store.set("priv", private_key_to_raw(priv))
+                self.identity = Identity.generate(self._node_name())
+                self.identity_store.set("priv", self.identity.private_raw())
                 self.identity_store.flush()
                 print("[MeshCore] Generated new node identity")
-            pub_raw = public_key_to_raw(priv)
-            self.packet_builder = MeshCorePacketBuilder(pub_raw, priv, self._node_name())
             print("[MeshCore] Node '{}' pubkey={}".format(
-                self.packet_builder.node_name, binascii.hexlify(pub_raw).decode()))
+                self.identity.name, binascii.hexlify(self.identity.public_key).decode()))
         except Exception as e:
             import sys
             print("[MeshCore] Identity load failed:", e)
             sys.print_exception(e)
-            self.packet_builder = None
+            self.identity = None
 
     def _transmit(self, packet):
         """Schedule a raw packet for transmission over LoRa (bypasses BadgeNet
@@ -158,15 +150,15 @@ class MeshcoreApp(BaseApp):
         persisted channel set (key_hex -> name) to the decoder's CHANNELS."""
         self.channel_store = DataFile(CHANNEL_STORE_NAME)
         if not list(self.channel_store.db.keys()):
-            for key_hex, name in DEFAULT_CHANNELS.items():
-                self.channel_store.set(key_hex, name)
+            for ch in DEFAULT_CHANNELS:
+                self.channel_store.set(ch.key_hex, ch.name)
             self.channel_store.flush()
-        mapping = {}
+        channels = []
         for k, v in self.channel_store.db.items():
             key_hex = k.decode() if isinstance(k, bytes) else k
             name = v.decode() if isinstance(v, bytes) else v
-            mapping[key_hex] = name
-        set_channels(mapping)
+            channels.append(Channel(key_hex, name))
+        registry.replace(channels)
 
     def _persist_channel(self, key_hex, name):
         if self.channel_store:
@@ -190,16 +182,15 @@ class MeshcoreApp(BaseApp):
 
     def _store_group_message(self, frame, recv_time, rssi, snr):
         """Parse a raw frame and, if it's a decodable group text, save it per-channel."""
-        parsed = parse_meshcore_packet(frame)
-        if not parsed:
+        packet = Packet.parse(frame)
+        if not packet:
             return
-        _route, payload, _hops, _hash_size, _path, payload_bytes = parsed
-        if payload not in ("GRP_TXT", "GRP_DAT"):
+        if packet.payload_type not in (PayloadType.GRP_TXT, PayloadType.GRP_DATA):
             return
-        decrypted = try_decrypt_group_text(payload_bytes)
-        if not decrypted:
+        decoded = GroupText.decode(packet.payload, registry)
+        if not decoded:
             return
-        channel_id, room_name, sender, text, msg_time = decrypted
+        channel_id, room_name, sender, text, msg_time = decoded
         message = ChannelMessage(recv_time, msg_time, sender, text, rssi, snr)
         channel = self.channels.get(channel_id)
         if channel is None:
@@ -299,7 +290,7 @@ class MeshcoreApp(BaseApp):
     def _refresh_channel_order(self):
         """Build the ordered list of channels: every configured channel, plus any
         channel we have received messages for that isn't in the config."""
-        order = [(key_hex, name) for key_hex, name in CHANNELS.items()]
+        order = list(registry.items())
         order.sort(key=lambda c: c[1])
         known = set(cid for cid, _ in order)
         for cid in self.channels:
@@ -410,7 +401,8 @@ class MeshcoreApp(BaseApp):
         self.page.populate_message_rows(display)
 
     def _name_for(self, channel_id):
-        return CHANNELS.get(channel_id, channel_id[:8])
+        ch = registry.get(channel_id)
+        return ch.name if ch else channel_id[:8]
 
     def _build_placeholder(self, title, body):
         self.page = Page()
@@ -476,7 +468,7 @@ class MeshcoreApp(BaseApp):
         if not name.startswith("#"):
             name = "#" + name
         key_hex = derive_channel_key(name)
-        if add_group_channel(key_hex, name):
+        if registry.add(Channel(key_hex, name)):
             self._persist_channel(key_hex, name)
             print("[MeshCore] Added # channel '{}' key={}".format(name, key_hex))
             self._finish_add(key_hex)
@@ -484,7 +476,7 @@ class MeshcoreApp(BaseApp):
             self.page.infobar_right.set_text("Channel exists")
 
     def _commit_private(self, key_hex):
-        if add_group_channel(key_hex, self.add_name):
+        if registry.add(Channel(key_hex, self.add_name)):
             self._persist_channel(key_hex, self.add_name)
             print(
                 "[MeshCore] Added private channel '{}' key={}".format(
@@ -521,7 +513,7 @@ class MeshcoreApp(BaseApp):
         cid, name = self._channel_order[self.channel_sel]
         if cid in PROTECTED_CHANNELS:
             return
-        remove_group_channel(cid)
+        registry.remove(cid)
         self._unpersist_channel(cid)
         self.channels.pop(cid, None)
         self.channel_names.pop(cid, None)
@@ -591,8 +583,12 @@ class MeshcoreApp(BaseApp):
             self.page.scroll_down(scroll)
 
     def _send_group_txt(self, message):
+        channel = registry.get(self.active_channel_id)
+        if channel is None:
+            self.page.infobar_right.set_text("Unknown channel")
+            return
         try:
-            packet = self.packet_builder.build_group_txt(self.active_channel_id, message)
+            packet = GroupText(self.identity, channel, message).to_bytes()
         except Exception as e:
             import sys
             print("[MeshCore] Group TXT packet build failed:", e)
@@ -668,16 +664,16 @@ class MeshcoreApp(BaseApp):
         self.page = Page()
         self.page.create_infobar(["Advert", ""])
         self.page.create_content()
-        if not self.packet_builder:
+        if not self.identity:
             self._content_label(
                 "Node identity unavailable.\nCannot build adverts."
             )
             self.page.create_menubar(["", "", "", "Menu", "Home"])
             self.page.replace_screen()
             return
-        pub_hex = binascii.hexlify(self.packet_builder.public_key).decode()
+        pub_hex = binascii.hexlify(self.identity.public_key).decode()
         lines = [
-            "Node: {}".format(self.packet_builder.node_name),
+            "Node: {}".format(self.identity.name),
             "Key:  {}...".format(pub_hex[:24]),
             "",
         ]
@@ -693,17 +689,17 @@ class MeshcoreApp(BaseApp):
         self.page.replace_screen()
 
     def _run_advert(self):
-        if not self.packet_builder:
+        if not self.identity:
             return
         if self.badge.keyboard.f1():
-            self._send_advert(MeshCorePacketBuilder.ROUTE_DIRECT, "Direct")
+            self._send_advert(RouteType.DIRECT, "Direct")
         elif self.badge.keyboard.f2():
-            self._send_advert(MeshCorePacketBuilder.ROUTE_FLOOD, "Flood")
+            self._send_advert(RouteType.FLOOD, "Flood")
 
     def _send_advert(self, route_type, label):
         ts = int(time.time())
         try:
-            packet = self.packet_builder.build_advert(route_type=route_type, timestamp=ts)
+            packet = Advert(self.identity, route_type=route_type, timestamp=ts).to_bytes()
         except Exception as e:
             print("[MeshCore] Advert build failed:", e)
             self.page.infobar_right.set_text("Build error")
