@@ -58,6 +58,35 @@ def decrypt_aes_ecb(key: bytes, ciphertext: bytes) -> bytes:
     cipher = cryptolib.aes(key[:16], 1)
     return cipher.decrypt(ciphertext)
 
+
+def encrypt_aes_ecb(key: bytes, plaintext: bytes) -> bytes:
+    # AES-128-ECB (Mode 1) using the first 16 bytes of the key.
+    cipher = cryptolib.aes(key[:16], 1)
+    return cipher.encrypt(plaintext)
+
+
+# ----------------------------------------------------------------------------
+# Channel crypto primitives. These are the single source of truth shared by the
+# decoder (try_decrypt_group_text) and the encoder (MeshCorePacketBuilder), so
+# the two can never drift. A channel's hex key is 32 chars / 16 raw bytes.
+# ----------------------------------------------------------------------------
+def channel_shared_secret(key_hex: str) -> bytes:
+    """Return the 32-byte zero-padded shared secret used as the MAC key.
+
+    AES uses the first 16 bytes of this (the raw channel key)."""
+    key = bytes.fromhex(key_hex)
+    return key + b"\x00" * (32 - len(key))
+
+
+def channel_hash(key_hex: str) -> bytes:
+    """1-byte channel hash = first byte of sha256(raw 16-byte channel key)."""
+    return hashlib.sha256(bytes.fromhex(key_hex)).digest()[:1]
+
+
+def channel_mac(shared_secret: bytes, ciphertext: bytes) -> bytes:
+    """2-byte MAC over the ciphertext, keyed by the 32-byte shared secret."""
+    return hmac.new(shared_secret, ciphertext, hashlib.sha256).digest()[:2]
+
 def try_decrypt_group_text(payload_bytes):
     """Attempt to decrypt a group text message payload using known keys.
 
@@ -71,34 +100,26 @@ def try_decrypt_group_text(payload_bytes):
     """
     for key_hex, room_name in CHANNELS.items():
         try:
-            channel_key = bytes.fromhex(key_hex)
-            
-            # Compute expected channel hash (always exactly 1 byte in MeshCore)
-            expected_hash = hashlib.sha256(channel_key).digest()[:1]
-            
-            # Extract channel hash from payload (always exactly 1 byte)
-            actual_hash = payload_bytes[:1]
-            if actual_hash != expected_hash:
+            # Channel hash is always exactly 1 byte at the start of the payload.
+            if payload_bytes[:1] != channel_hash(key_hex):
                 continue  # This key does not match the channel hash of the packet
-                
-            # MAC is always 2 bytes in MeshCore, placed right after the 1-byte channel hash
+
+            # MAC is always 2 bytes, placed right after the 1-byte channel hash.
             mac_idx = 1
             cipher_idx = mac_idx + 2
-            
             if len(payload_bytes) < cipher_idx:
                 continue
-                
+
             mac = payload_bytes[mac_idx:cipher_idx]
             ciphertext = payload_bytes[cipher_idx:]
-            
-            # Verify MAC using standard hmac (pad shared secret to 32 bytes)
-            shared_secret = channel_key + b'\x00' * (32 - len(channel_key))
-            expected_mac = hmac.new(shared_secret, ciphertext, hashlib.sha256).digest()[:2]
-            if mac != expected_mac:
+
+            # Verify the 2-byte MAC keyed by the 32-byte padded shared secret.
+            shared_secret = channel_shared_secret(key_hex)
+            if mac != channel_mac(shared_secret, ciphertext):
                 print(f"[Decrypt Debug] MAC mismatch for {room_name}")
                 continue
-                
-            plaintext = decrypt_aes_ecb(shared_secret[:16], ciphertext)
+
+            plaintext = decrypt_aes_ecb(shared_secret, ciphertext)
             
             # plaintext format: [timestamp:4][flags:1][sender_name: message]
             if len(plaintext) < 5:

@@ -1,8 +1,12 @@
 import struct
 import time
-import hashlib
 from cryptography import ed25519, serialization
-import ucryptolib as cryptolib
+from net.meshcore import (
+    channel_shared_secret,
+    channel_hash,
+    channel_mac,
+    encrypt_aes_ecb,
+)
 
 # ---------------------------------------------------------------------
 # Identity helpers (a MeshCore node's identity is an Ed25519 keypair).
@@ -155,45 +159,31 @@ class MeshCorePacketBuilder:
         return self.build_packet(route_type, self.TYPE_ADVERT, payload)
     
 
-    def hmac_sha256(self, key, msg):
-        """A lightweight HMAC-SHA256 implementation for MicroPython."""
-        if len(key) > 64:
-            key = hashlib.sha256(key).digest()
-        key = key + b'\x00' * (64 - len(key))
-        
-        o_key_pad = bytes((x ^ 0x5c) for x in key)
-        i_key_pad = bytes((x ^ 0x36) for x in key)
-        
-        inner = hashlib.sha256(i_key_pad + msg).digest()
-        return hashlib.sha256(o_key_pad + inner).digest()
-    
     def build_group_txt(self, channel_key, message: str):
-        """Build a complete, ready-to-transmit GROUP_TXT packet."""
+        """Build a complete, ready-to-transmit GROUP_TXT packet.
 
-        shared_secret = bytes.fromhex(channel_key) + b'\x00' * (32 - len(channel_key))
+        Uses the shared channel-crypto primitives from net.meshcore so the
+        channel hash, AES key and MAC stay byte-for-byte compatible with the
+        decoder. `channel_key` is the 32-char hex channel key.
+        """
+        # 32-byte padded shared secret (MAC key); AES uses its first 16 bytes.
+        shared_secret = channel_shared_secret(channel_key)
 
         full_message = self.node_name + ": " + message
 
-        # 2. Assemble the plaintext (4-byte Little-Endian Timestamp + UTF-8 Text)
+        # Plaintext: 4-byte LE timestamp + 1-byte flags + UTF-8 text.
         timestamp = int(time.time())
         plaintext = struct.pack('<IB', timestamp, 0x00) + full_message.encode('UTF-8')
-        
-        # 3. Apply Zero-Padding to a multiple of 16 bytes for AES-ECB
+
+        # Zero-pad to a 16-byte multiple for AES-ECB.
         pad_len = 16 - (len(plaintext) % 16)
         padded_plaintext = plaintext + (b'\x00' * pad_len)
-        
-        # 4. Encrypt using AES-128 in ECB mode
-        cipher = cryptolib.aes(shared_secret, 1)
-        encrypted_data = cipher.encrypt(padded_plaintext)
-        
-        # 5. Calculate the 2-byte MAC over the ENCRYPTED data
-        mac_full = self.hmac_sha256(shared_secret, encrypted_data)
-        mac = mac_full[:2]
-        
-        channel_hash = hashlib.sha256(shared_secret).digest()[:1]
 
-        # 7. Final Packet Assembly
-        payload = channel_hash + mac + encrypted_data
-        
+        encrypted_data = encrypt_aes_ecb(shared_secret, padded_plaintext)
+
+        # 2-byte MAC over the ciphertext, 1-byte channel hash prefix.
+        mac = channel_mac(shared_secret, encrypted_data)
+        payload = channel_hash(channel_key) + mac + encrypted_data
+
         return self.build_packet(self.ROUTE_FLOOD, self.TYPE_GRP_TXT, payload)
     
