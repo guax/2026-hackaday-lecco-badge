@@ -1003,15 +1003,17 @@ class MeshcoreApp(BaseApp):
             t = time.localtime(m.recv_time)
             time_str = "{:02d}:{:02d}".format(t[3], t[4])
             who = "me" if m.outgoing else "them"
-            status = ""
+            
             if m.outgoing:
                 if m.delivered:
-                    status = " [Delivered]"
+                    status = ("Delivered", styles.lvg_color_green, styles.hackaday_white)
                 elif time.time() - m.msg_time > 15:
-                    status = " [Failed]"
+                    status = ("Failed", styles.lvg_color_red, styles.hackaday_white)
                 else:
-                    status = " [Sending]"
-            display.append((time_str, "{}{}: {}".format(who, status, m.text)))
+                    status = ("Sending", styles.hackaday_grey, styles.hackaday_white)
+                display.append((time_str, "{}: {}".format(who, m.text), status))
+            else:
+                display.append((time_str, "{}: {}".format(who, m.text)))
         self.page.populate_message_rows(display)
 
     def _run_dm_chat(self):

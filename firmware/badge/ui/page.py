@@ -56,35 +56,62 @@ class Page:
         self.content.set_flex_grow(1)
 
     def add_message_rows(self, message_count, left_width=80):
-        left_pad = 5
-        self.message_rows = lvgl.table(self.content)
+        self.left_width = left_width
+        self.left_pad = 5
+        self.message_rows = lvgl.obj(self.content)
         self.message_rows.add_style(styles.content_style, 0)
-        self.message_rows.add_style(styles.content_style, lvgl.PART.ITEMS)
-
-        self.message_rows.set_style_pad_top(0, lvgl.PART.ITEMS)
-        self.message_rows.set_style_pad_bottom(0, lvgl.PART.ITEMS)
-        self.message_rows.set_style_pad_left(left_pad, lvgl.PART.ITEMS)
-
-        self.message_rows.set_row_count(message_count)
         self.message_rows.set_width(lvgl.pct(100))
         self.message_rows.set_height(lvgl.pct(100))
-
-        ## Set up two columns: sender, message
-        self.message_rows.set_column_count(2)
-        self.message_rows.set_column_width(0, left_width)
-        self.message_rows.set_column_width(1, self.scr.get_x2() - left_width - left_pad)
+        self.message_rows.set_flex_flow(lvgl.FLEX_FLOW.COLUMN)
+        self.message_rows.set_style_pad_left(self.left_pad, 0)
+        self.message_rows.set_style_pad_row(2, 0)
+        self.message_rows.set_scrollbar_mode(lvgl.SCROLLBAR_MODE.AUTO)
+        self.row_objs = []
         self.selected_row = None
  
     def populate_message_rows(self, messages):  ## Populate
-        self.message_rows.set_row_count(len(messages))
+        self.message_rows.update_layout()
+        at_bottom = self.message_rows.get_scroll_bottom() <= 0
+
+        for row in self.row_objs:
+            row.delete()
+        self.row_objs = []
+        
         for i, message in enumerate(messages):
-            self.message_rows.set_cell_value(i, 0, str(message[0]))
-            self.message_rows.set_cell_value(i, 1, str(message[1]))
+            row = lvgl.obj(self.message_rows)
+            row.add_style(styles.content_style, 0)
+            row.set_width(lvgl.pct(100))
+            row.set_height(lvgl.SIZE_CONTENT)
+            row.set_style_pad_all(0, 0)
+            row.set_style_border_width(0, 0)
+            
+            left_lbl = lvgl.label(row)
+            left_lbl.set_width(self.left_width)
+            left_lbl.set_text(str(message[0]))
+            left_lbl.align(lvgl.ALIGN.TOP_LEFT, 0, 0)
+            
+            right_lbl = lvgl.label(row)
+            right_lbl.set_width(self.scr.get_x2() - self.left_width - self.left_pad)
+            right_lbl.set_text(str(message[1]))
+            right_lbl.align(lvgl.ALIGN.TOP_LEFT, self.left_width, 0)
+            
+            if len(message) > 2:
+                status_text, status_bg, status_fg = message[2]
+                status_lbl = lvgl.label(row)
+                status_lbl.add_style(styles.content_style, 0)
+                status_lbl.set_style_bg_opa(255, 0)
+                status_lbl.set_style_bg_color(status_bg, 0)
+                status_lbl.set_style_text_color(status_fg, 0)
+                status_lbl.set_style_pad_all(2, 0)
+                status_lbl.set_text(status_text)
+                status_lbl.align(lvgl.ALIGN.BOTTOM_RIGHT, -10, 0)
+                
+            self.row_objs.append(row)
+
         if self.selected_row is None and len(messages):
             self.selected_row = len(messages) - 1
-            self.message_rows.set_selected_cell(self.selected_row, 0)
-        if self.selected_row == len(messages) - 1:
-            self.scroll_down()  # Follow the bottom
+        if at_bottom or self.selected_row is None:
+            self.scroll_bottom()  # Follow the bottom
 
     def scroll_up(self, pixels=13):
         self.message_rows.scroll_by_bounded(0, pixels, False)
@@ -93,6 +120,7 @@ class Page:
         self.message_rows.scroll_by_bounded(0, -1 * pixels, False)
 
     def scroll_bottom(self):
+        self.message_rows.update_layout()
         dy_to_bottom = self.message_rows.get_scroll_bottom()
         self.message_rows.scroll_by_bounded(0, -1 * dy_to_bottom, False)
 
