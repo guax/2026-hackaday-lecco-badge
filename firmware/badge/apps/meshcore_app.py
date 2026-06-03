@@ -38,6 +38,7 @@ CONTACT_STORE_NAME = "meshcore_contacts"
 APP_NAME = "MeshCore"
 
 MAX_MESSAGE_LEN = 130
+PACKET_BUFFER_LEN = 10
 
 # Application modes. MENU is the landing screen reached via F4.
 MODE_MENU = 0
@@ -50,6 +51,7 @@ MODE_ADVERT = 6
 MODE_CONTACTS_ALL = 7
 MODE_CONTACT_DETAILS = 8
 MODE_DM_CHAT = 9
+MODE_ANALYSER = 10
 
 # Built-in channels that may not be deleted, identified by their key (hex).
 PROTECTED_CHANNELS = (PUBLIC_KEY,)
@@ -72,7 +74,7 @@ class DirectMessage:
 class MeshcoreApp(BaseApp):
     def __init__(self, name: str, badge):
         super().__init__(name, badge)
-        self.packet_queue = deque([], 10)  # Store last 10 raw packet frames and RSSI/SNR
+        self.packet_queue = deque([], PACKET_BUFFER_LEN)
         # Decoded group-channel message history, keyed by channel_id (the channel's
         # symmetric key in hex) since names can collide but keys are unique.
         # Each value is a deque of ChannelMessage, newest last.
@@ -371,10 +373,12 @@ class MeshcoreApp(BaseApp):
             self.switch_to_background()
             return
 
-        # F4 always returns to the MeshCore main menu.
+        # F4 is the menu button everywhere except at the main menu, where it opens the analyser
         if self.badge.keyboard.f4():
-            self._set_mode(MODE_MENU)
-            return
+            if self.mode == MODE_MENU:
+                self._set_mode(MODE_ANALYSER)
+            else:
+                self._set_mode(MODE_MENU)
 
         # Dispatch contextual input to the active mode.
         if self.mode == MODE_MENU:
@@ -397,6 +401,8 @@ class MeshcoreApp(BaseApp):
             self._run_dm_chat()
         elif self.mode == MODE_ADVERT:
             self._run_advert()
+        elif self.mode == MODE_ANALYSER:
+            self._run_analyser()
 
     # ------------------------------------------------------------------
     # Mode switching / screen building
@@ -426,6 +432,8 @@ class MeshcoreApp(BaseApp):
             self._build_dm_chat()
         elif mode == MODE_ADVERT:
             self._build_advert()
+        elif mode == MODE_ANALYSER:
+            self._build_analyser()
 
     def _content_label(self, text):
         """Create a left-aligned multiline label inside the current page content."""
@@ -444,9 +452,10 @@ class MeshcoreApp(BaseApp):
             "Select a mode:\n"
             "F1  Channels  - browse decoded channel messages\n"
             "F2  Direct Msg - send/read direct messages\n"
-            "F3  Advert     - broadcast this node's identity"
+            "F3  Advert     - broadcast this node's identity\n"
+            "F4  Analyser   - inspect raw packet traffic"
         )
-        self.page.create_menubar(["Channels", "Direct", "Advert", "Menu", "Home"])
+        self.page.create_menubar(["Channels", "Direct", "Advert", "Analyser", "Home"])
         self.page.replace_screen()
 
     def _refresh_channel_order(self):
@@ -699,6 +708,8 @@ class MeshcoreApp(BaseApp):
             self._set_mode(MODE_DM)
         elif self.badge.keyboard.f3():
             self._set_mode(MODE_ADVERT)
+        elif self.badge.keyboard.f4():
+            self._set_mode(MODE_ANALYSER)
 
     def _run_channels(self):
         if not self._channel_order:
@@ -1129,3 +1140,200 @@ class MeshcoreApp(BaseApp):
         }
         print("[MeshCore] Advert ({}) {}B: {}".format(label, len(packet), hexstr))
         self._build_advert()
+
+    # ------------------------------------------------------------------
+    # Packet Analyser
+    # ------------------------------------------------------------------
+    # Map payload type -> (label, bg_color, fg_color)
+    _PKT_TYPE_COLORS = None
+
+    @staticmethod
+    def _pkt_type_colors():
+        if MeshcoreApp._PKT_TYPE_COLORS is None:
+            MeshcoreApp._PKT_TYPE_COLORS = {
+                PayloadType.ADVERT:   ("ADVERT",  styles.pkt_color_advert,  styles.hackaday_white),
+                PayloadType.GRP_TXT:  ("GRP_TXT", styles.pkt_color_grp,     styles.hackaday_white),
+                PayloadType.GRP_DATA: ("GRP_DAT", styles.pkt_color_grp,     styles.hackaday_white),
+                PayloadType.TXT_MSG:  ("TXT_MSG", styles.pkt_color_txt,     styles.hackaday_white),
+                PayloadType.ACK:      ("ACK",     styles.pkt_color_ack,     styles.hackaday_white),
+                PayloadType.PATH:     ("PATH",    styles.pkt_color_path,    styles.hackaday_white),
+            }
+        return MeshcoreApp._PKT_TYPE_COLORS
+
+    def _analyser_pkt_info(self, packet):
+        """Return a short context string for the analyser row."""
+        if packet.payload_type == PayloadType.ADVERT:
+            from net.meshcore.packet.advert import Advert as AdvPkt
+            dec = AdvPkt.decode(packet.payload)
+            if dec:
+                return dec.name or dec.pubkey_hex[:8]
+            return "advert"
+        elif packet.payload_type in (PayloadType.GRP_TXT, PayloadType.GRP_DATA):
+            return "group msg"
+        elif packet.payload_type == PayloadType.TXT_MSG:
+            if len(packet.payload) >= 2:
+                return "dst:{:02x} src:{:02x}".format(packet.payload[0], packet.payload[1])
+            return "dm"
+        elif packet.payload_type == PayloadType.ACK:
+            if len(packet.payload) >= 4:
+                return packet.payload[:4].hex()
+            return "ack"
+        elif packet.payload_type == PayloadType.PATH:
+            return "hops:{}".format(packet.hop_count)
+        return "?"
+
+    def _build_analyser(self):
+        self.page = Page()
+        self.page.create_infobar(["Packet Analyser", "{} pkts".format(len(self.packet_queue))])
+        self.page.create_content()
+        self._analyser_paused = False
+        self._analyser_last_count = -1
+        self._analyser_rows = []
+        self._refresh_analyser()
+        self.page.create_menubar(["", "Pause", "Clear", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _refresh_analyser(self):
+        count = len(self.packet_queue)
+        if count == self._analyser_last_count:
+            return
+        self._analyser_last_count = count
+        self.page.infobar_right.set_text("{} pkts".format(count))
+
+        # Clean up old row objects
+        for row in self._analyser_rows:
+            row.delete()
+        self._analyser_rows = []
+
+        if not self.packet_queue:
+            lbl = lvgl.label(self.page.content)
+            lbl.add_style(styles.content_style, 0)
+            lbl.set_text("No packets received yet.")
+            lbl.align(lvgl.ALIGN.TOP_LEFT, 8, 6)
+            self._analyser_rows.append(lbl)
+            return
+
+        # Create a scrollable container
+        container = lvgl.obj(self.page.content)
+        container.add_style(styles.content_style, 0)
+        container.set_width(lvgl.pct(100))
+        container.set_height(lvgl.pct(100))
+        container.set_flex_flow(lvgl.FLEX_FLOW.COLUMN)
+        container.set_style_pad_left(2, 0)
+        container.set_style_pad_row(1, 0)
+        container.set_scrollbar_mode(lvgl.SCROLLBAR_MODE.AUTO)
+        self._analyser_container = container
+        self._analyser_rows.append(container)
+
+        type_colors = self._pkt_type_colors()
+
+        for recv_time, frame, rssi, snr in self.packet_queue:
+            packet = Packet.parse(frame)
+
+            # Row container
+            row = lvgl.obj(container)
+            row.add_style(styles.content_style, 0)
+            row.set_width(lvgl.pct(100))
+            row.set_height(lvgl.SIZE_CONTENT)
+            row.set_style_min_height(14, 0)
+            row.set_style_pad_all(0, 0)
+            row.set_style_border_width(0, 0)
+
+            x = 0
+
+            # Time
+            t = time.localtime(recv_time)
+            time_str = "{:02d}:{:02d}:{:02d}".format(t[3], t[4], t[5])
+            time_lbl = lvgl.label(row)
+            time_lbl.set_text(time_str)
+            time_lbl.set_style_text_color(styles.pkt_color_rssi, 0)
+            time_lbl.align(lvgl.ALIGN.TOP_LEFT, x, 0)
+            x += 58
+
+            # Type badge
+            if packet:
+                tc = type_colors.get(packet.payload_type)
+                if tc:
+                    type_text, type_bg, type_fg = tc
+                else:
+                    type_text = "T{}".format(packet.payload_type)
+                    type_bg = styles.pkt_color_unknown
+                    type_fg = styles.hackaday_white
+            else:
+                type_text = "ERR"
+                type_bg = styles.pkt_color_unknown
+                type_fg = styles.hackaday_white
+
+            type_lbl = lvgl.label(row)
+            type_lbl.set_text(type_text)
+            type_lbl.set_style_bg_opa(255, 0)
+            type_lbl.set_style_bg_color(type_bg, 0)
+            type_lbl.set_style_text_color(type_fg, 0)
+            type_lbl.set_style_pad_left(3, 0)
+            type_lbl.set_style_pad_right(3, 0)
+            type_lbl.set_style_pad_top(1, 0)
+            type_lbl.set_style_pad_bottom(1, 0)
+            type_lbl.align(lvgl.ALIGN.TOP_LEFT, x, 0)
+            x += 65
+
+            # Route
+            if packet:
+                is_flood = packet.route_type in (RouteType.FLOOD, RouteType.TRANSPORT_FLOOD)
+                route_text = "FLD" if is_flood else "DIR"
+                route_color = styles.pkt_color_route_fld if is_flood else styles.pkt_color_route_dir
+            else:
+                route_text = "?"
+                route_color = styles.pkt_color_rssi
+
+            route_lbl = lvgl.label(row)
+            route_lbl.set_text(route_text)
+            route_lbl.set_style_text_color(route_color, 0)
+            route_lbl.align(lvgl.ALIGN.TOP_LEFT, x, 0)
+            x += 30
+
+            # RSSI
+            rssi_lbl = lvgl.label(row)
+            rssi_lbl.set_text("{}dBm".format(rssi))
+            rssi_lbl.set_style_text_color(styles.pkt_color_rssi, 0)
+            rssi_lbl.align(lvgl.ALIGN.TOP_LEFT, x, 0)
+            x += 55
+
+            # Info
+            if packet:
+                info = self._analyser_pkt_info(packet)
+            else:
+                info = "parse failed"
+            info_lbl = lvgl.label(row)
+            info_lbl.set_text(info)
+            info_lbl.align(lvgl.ALIGN.TOP_LEFT, x, 0)
+
+        # Scroll to bottom
+        container.update_layout()
+        dy = container.get_scroll_bottom()
+        container.scroll_by_bounded(0, -1 * dy, False)
+
+    def _run_analyser(self):
+        if self.badge.keyboard.f1():  # Details TBD
+            # self._set_mode(MODE_ADVERT)
+            return
+        if self.badge.keyboard.f2():  # Pause / Resume
+            self._analyser_paused = not self._analyser_paused
+            label = "Resume" if self._analyser_paused else "Pause"
+            self.page.set_menubar_button_label(1, label)
+            return
+        if self.badge.keyboard.f3():  # Clear
+            self.packet_queue = deque([], PACKET_BUFFER_LEN)
+            self._analyser_last_count = -1
+            self._refresh_analyser()
+            return
+        key = self.badge.keyboard.read_key()
+        if hasattr(self, '_analyser_container'):
+            scroll = 13
+            if self.badge.keyboard.shift_pressed:
+                scroll *= 5
+            if key == self.badge.keyboard.UP:
+                self._analyser_container.scroll_by_bounded(0, scroll, False)
+            elif key == self.badge.keyboard.DOWN:
+                self._analyser_container.scroll_by_bounded(0, -1 * scroll, False)
+        if not self._analyser_paused:
+            self._refresh_analyser()

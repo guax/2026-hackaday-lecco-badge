@@ -48,5 +48,13 @@ lvg_color_black  	= lvgl.color_hex(0x000000)
 lvg_color_red   	= lvgl.color_hex(0x990000)
 lvg_color_green 	= lvgl.color_hex(0x006600)
 
-
-
+# Packet analyser type colors
+pkt_color_advert  = lvgl.color_hex(0xff9800)  # Orange
+pkt_color_grp     = lvgl.color_hex(0x4caf50)  # Green
+pkt_color_txt     = lvgl.color_hex(0x9c27b0)  # Purple
+pkt_color_ack     = lvgl.color_hex(0x2196f3)  # Blue
+pkt_color_path    = lvgl.color_hex(0x00bcd4)  # Cyan
+pkt_color_unknown = lvgl.color_hex(0xf44336)  # Red
+pkt_color_rssi    = lvgl.color_hex(0x888888)  # Grey
+pkt_color_route_fld = lvgl.color_hex(0xf44336)  # Red
+pkt_color_route_dir = lvgl.color_hex(0x4caf50)  # Green
