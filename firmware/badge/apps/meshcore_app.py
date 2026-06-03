@@ -60,9 +60,14 @@ ChannelMessage = namedtuple(
 )
 
 # A single direct message (1:1). `outgoing` marks messages we sent.
-DirectMessage = namedtuple(
-    "DirectMessage", ["recv_time", "msg_time", "outgoing", "text"]
-)
+class DirectMessage:
+    def __init__(self, recv_time, msg_time, outgoing, text, ack_hash=None, delivered=False):
+        self.recv_time = recv_time
+        self.msg_time = msg_time
+        self.outgoing = outgoing
+        self.text = text
+        self.ack_hash = ack_hash
+        self.delivered = delivered
 
 class MeshcoreApp(BaseApp):
     def __init__(self, name: str, badge):
@@ -235,6 +240,31 @@ class MeshcoreApp(BaseApp):
             self._store_advert(packet)
         elif packet.payload_type == PayloadType.TXT_MSG:
             self._store_direct_message(packet, recv_time)
+        elif packet.payload_type == PayloadType.ACK:
+            self._process_ack(packet)
+        elif packet.payload_type == PayloadType.PATH:
+            self._process_path(packet)
+
+    def _process_ack(self, packet):
+        if len(packet.payload) >= 4:
+            ack_hash = packet.payload[:4]
+            self._mark_delivered(ack_hash)
+
+    def _process_path(self, packet):
+        from net.meshcore.packet.path_return import PathReturn
+        decoded = PathReturn.decode(packet.payload, self.identity, contacts)
+        if decoded and decoded.extra_type == PayloadType.ACK:
+            if len(decoded.extra) >= 4:
+                ack_hash = decoded.extra[:4]
+                self._mark_delivered(ack_hash)
+
+    def _mark_delivered(self, ack_hash):
+        for thread in self.dm_messages.values():
+            for msg in thread:
+                if msg.outgoing and msg.ack_hash == ack_hash:
+                    msg.delivered = True
+                    self._view_msg_count = -1
+                    print("[MeshCore] Delivered", ack_hash.hex())
 
     def _store_direct_message(self, packet, recv_time):
         """Decode a direct message addressed to us, ACK it, and store it."""
@@ -950,11 +980,20 @@ class MeshcoreApp(BaseApp):
         self.page.replace_screen()
 
     def _refresh_dm_view(self):
-        """Re-populate the DM thread only when the message count changed."""
+        """Re-populate the DM thread."""
         msgs = self.dm_messages.get(self.active_dm_key)
         count = len(msgs) if msgs else 0
-        if count == self._view_msg_count:
+        
+        has_sending = False
+        if msgs:
+            for m in msgs:
+                if m.outgoing and not m.delivered and (time.time() - m.msg_time <= 15):
+                    has_sending = True
+                    break
+
+        if count == self._view_msg_count and not has_sending:
             return
+            
         self._view_msg_count = count
         if not msgs:
             self.page.populate_message_rows([("", "No messages yet.")])
@@ -964,7 +1003,15 @@ class MeshcoreApp(BaseApp):
             t = time.localtime(m.recv_time)
             time_str = "{:02d}:{:02d}".format(t[3], t[4])
             who = "me" if m.outgoing else "them"
-            display.append((time_str, "{}: {}".format(who, m.text)))
+            status = ""
+            if m.outgoing:
+                if m.delivered:
+                    status = " [Delivered]"
+                elif time.time() - m.msg_time > 15:
+                    status = " [Failed]"
+                else:
+                    status = " [Sending]"
+            display.append((time_str, "{}{}: {}".format(who, status, m.text)))
         self.page.populate_message_rows(display)
 
     def _run_dm_chat(self):
@@ -1009,7 +1056,9 @@ class MeshcoreApp(BaseApp):
             self.page.infobar_right.set_text("Unknown contact")
             return
         try:
-            packet = DirectText(self.identity, c, message).to_bytes()
+            packet_obj = DirectText(self.identity, c, message)
+            packet = packet_obj.to_bytes()
+            expected_ack = packet_obj.expected_ack
         except Exception as e:
             import sys
             print("[MeshCore] DM packet build failed:", e)
@@ -1019,7 +1068,7 @@ class MeshcoreApp(BaseApp):
         print("[MeshCore] Sending DM packet:", packet.hex())
         self._transmit(packet)
         now = int(time.time())
-        self._append_dm(self.active_dm_key, DirectMessage(now, now, True, message))
+        self._append_dm(self.active_dm_key, DirectMessage(now, now, True, message, expected_ack))
 
     # ------------------------------------------------------------------
     # Advert flow

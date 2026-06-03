@@ -14,8 +14,11 @@ a 2-byte HMAC, keyed by the X25519 shared secret (same as direct messages).
 """
 
 from net.meshcore.constants import RouteType, PayloadType
-from net.meshcore.crypto import encrypt_aes_ecb, hmac_sha256
+from net.meshcore.crypto import encrypt_aes_ecb, decrypt_aes_ecb, hmac_sha256
 from net.meshcore.packet.base import Packet
+from collections import namedtuple
+
+DecodedPathReturn = namedtuple("DecodedPathReturn", ["sender_key", "extra_type", "extra"])
 
 
 class PathReturn(Packet):
@@ -43,3 +46,37 @@ class PathReturn(Packet):
         dest_hash = peer[:1]
         src_hash = self.identity.public_key[:1]
         return dest_hash + src_hash + mac + ciphertext
+
+    @classmethod
+    def decode(cls, payload, identity, contacts):
+        if identity is None or len(payload) < 4:
+            return None
+        dest_hash = payload[0]
+        if dest_hash != identity.public_key[0]:
+            return None
+        src_hash = payload[1]
+        mac = payload[2:4]
+        ciphertext = payload[4:]
+        if not ciphertext or len(ciphertext) % 16 != 0:
+            return None
+
+        for contact in contacts.all():
+            raw = bytes.fromhex(contact.pubkey_hex)
+            if not raw or raw[0] != src_hash:
+                continue
+            try:
+                secret = identity.shared_secret(raw)
+                if hmac_sha256(secret, ciphertext)[:2] != mac:
+                    continue
+                plaintext = decrypt_aes_ecb(secret, ciphertext)
+                if len(plaintext) < 1:
+                    continue
+                path_len = plaintext[0] & 0x3F
+                extra_idx = 1 + path_len
+                if extra_idx < len(plaintext):
+                    extra_type = plaintext[extra_idx] & 0x0F
+                    extra = plaintext[extra_idx+1:]
+                    return DecodedPathReturn(contact.pubkey_hex, extra_type, extra)
+            except Exception:
+                pass
+        return None

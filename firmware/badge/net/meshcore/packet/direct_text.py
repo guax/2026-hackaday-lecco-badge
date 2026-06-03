@@ -40,11 +40,16 @@ class DirectText(Packet):
         ts = int(time.time()) if timestamp is None else timestamp
         peer_pub = bytes.fromhex(contact.pubkey_hex)
         secret = identity.shared_secret(peer_pub)
-        super().__init__(self._build_payload(ts, secret, peer_pub), route_type)
+        payload, self.expected_ack = self._build_payload(ts, secret, peer_pub)
+        super().__init__(payload, route_type)
 
     def _build_payload(self, timestamp, secret, peer_pub):
         plaintext = struct.pack("<IB", timestamp, _TXT_TYPE_PLAIN) \
             + self.message.encode("utf-8")
+            
+        body = self.message.encode("utf-8")
+        expected_ack = sha256(plaintext[:5] + body + self.identity.public_key)[:4]
+        
         pad_len = 16 - (len(plaintext) % 16)
         plaintext += b"\x00" * pad_len
 
@@ -52,7 +57,7 @@ class DirectText(Packet):
         mac = hmac_sha256(secret, ciphertext)[:2]
         dest_hash = peer_pub[:1]
         src_hash = self.identity.public_key[:1]
-        return dest_hash + src_hash + mac + ciphertext
+        return dest_hash + src_hash + mac + ciphertext, expected_ack
 
     @classmethod
     def decode(cls, payload, identity, contacts):
