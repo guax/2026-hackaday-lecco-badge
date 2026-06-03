@@ -3,7 +3,9 @@
 Used to sign adverts and to label outgoing group messages.
 """
 
-from cryptography import ed25519, serialization
+from cryptography import ed25519, serialization, hashes
+
+from net.meshcore.x25519 import key_exchange
 
 DEFAULT_NAME = "Hackbadge"
 
@@ -16,6 +18,9 @@ class Identity:
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw,
         )
+        # X25519 shared secrets are deterministic per peer; cache them since the
+        # pure-Python scalar multiplication is relatively expensive.
+        self._secret_cache = {}
 
     @classmethod
     def generate(cls, name=DEFAULT_NAME):
@@ -38,3 +43,20 @@ class Identity:
     def sign(self, message) -> bytes:
         """Ed25519-sign a message, returning 64 bytes."""
         return self.private_key.sign(message)
+
+    def shared_secret(self, peer_public_key) -> bytes:
+        """Return the 32-byte MeshCore shared secret with a peer.
+
+        Equivalent to MeshCore's `ed25519_key_exchange`: X25519 ECDH between
+        our identity and the peer's Ed25519 public key. The result is cached
+        per peer because the pure-Python scalar multiplication is expensive.
+        """
+        peer = bytes(peer_public_key)
+        secret = self._secret_cache.get(peer)
+        if secret is None:
+            # X25519 private scalar = SHA512(seed)[:32] (clamped inside x25519).
+            digest = hashes.Hash(hashes.SHA512())
+            digest.update(self.private_raw())
+            secret = key_exchange(digest.finalize()[:32], peer)
+            self._secret_cache[peer] = secret
+        return secret

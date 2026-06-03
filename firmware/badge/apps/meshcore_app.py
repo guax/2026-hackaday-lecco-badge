@@ -12,6 +12,8 @@ from net.meshcore import (
     Packet,
     Advert,
     GroupText,
+    DirectText,
+    Ack,
     Channel,
     Identity,
     DEFAULT_CHANNELS,
@@ -20,6 +22,7 @@ from net.meshcore import (
     RouteType,
     derive_channel_key,
     registry,
+    contacts,
 )
 from ui import styles
 from ui.page import Page
@@ -28,6 +31,8 @@ from ui.page import Page
 CHANNEL_STORE_NAME = "meshcore_channels"
 # Persistent store holding this node's Ed25519 identity (raw private key seed).
 IDENTITY_STORE_NAME = "meshcore_identity"
+# Persistent store holding favorite contacts (pubkey hex -> display name).
+CONTACT_STORE_NAME = "meshcore_contacts"
 
 APP_NAME = "MeshCore"
 
@@ -41,6 +46,9 @@ MODE_CHANNEL_ADD = 3
 MODE_CHANNEL_DELETE = 4
 MODE_DM = 5
 MODE_ADVERT = 6
+MODE_CONTACTS_ALL = 7
+MODE_CONTACT_DETAILS = 8
+MODE_DM_CHAT = 9
 
 # Built-in channels that may not be deleted, identified by their key (hex).
 PROTECTED_CHANNELS = (PUBLIC_KEY,)
@@ -48,6 +56,11 @@ PROTECTED_CHANNELS = (PUBLIC_KEY,)
 # A single decoded channel message held in memory for later display.
 ChannelMessage = namedtuple(
     "ChannelMessage", ["recv_time", "msg_time", "sender", "text", "rssi", "snr"]
+)
+
+# A single direct message (1:1). `outgoing` marks messages we sent.
+DirectMessage = namedtuple(
+    "DirectMessage", ["recv_time", "msg_time", "outgoing", "text"]
 )
 
 class MeshcoreApp(BaseApp):
@@ -70,6 +83,20 @@ class MeshcoreApp(BaseApp):
         self._channel_order = []
         self._chan_labels = []
         self.channel_sel = 0
+        # Contacts list state: ordered list of Contact for the active contacts
+        # screen, its selection cursor, label widgets, and the selected pubkey.
+        self._contact_order = []
+        self._contact_labels = []
+        self.contact_sel = 0
+        self.active_contact_key = None
+        self.contact_store = None
+        # Direct-message history keyed by peer pubkey hex -> deque of DirectMessage.
+        self.dm_messages = {}
+        self.dm_buffer_len = 50
+        self.active_dm_key = None
+        # Recent (sender_key, timestamp, text) keys to drop duplicate DMs that
+        # arrive from sender retransmits / flood paths before our ACK lands.
+        self._recent_dm = deque([], 30)
         # Channel view state
         self.active_channel_id = None
         self.compose_active = False
@@ -94,6 +121,8 @@ class MeshcoreApp(BaseApp):
         self._load_channels()
         # Load (or create) this node's Ed25519 identity and packet builder.
         self._load_identity()
+        # Load persisted favorite contacts into the contact book.
+        self._load_contacts()
         # Register the raw packet receiver callback
         register_raw_receiver(self.handle_raw_packet)
 
@@ -170,23 +199,96 @@ class MeshcoreApp(BaseApp):
             self.channel_store.delete(key_hex)
             self.channel_store.flush()
 
+    def _load_contacts(self):
+        """Open the contacts store and seed persisted favorites into the book."""
+        self.contact_store = DataFile(CONTACT_STORE_NAME)
+        for k, v in self.contact_store.db.items():
+            pubkey_hex = k.decode() if isinstance(k, bytes) else k
+            name = v.decode() if isinstance(v, bytes) else v
+            contacts.load_favorite(pubkey_hex, name)
+
+    def _persist_favorite(self, contact):
+        if self.contact_store:
+            self.contact_store.set(contact.pubkey_hex, contact.name)
+            self.contact_store.flush()
+
+    def _unpersist_favorite(self, pubkey_hex):
+        if self.contact_store:
+            self.contact_store.delete(pubkey_hex)
+            self.contact_store.flush()
+
     def handle_raw_packet(self, frame):
         rssi = self.badge.lora.get_rssi()
         snr = self.badge.lora.get_snr()
         recv_time = time.time()
         # Append tuple of (time, raw_frame_bytes, rssi, snr)
         self.packet_queue.append((recv_time, frame, rssi, snr))
-        # Decode and persist group channel messages so they can be viewed later,
-        # even if this happens while the app is in the background.
-        self._store_group_message(frame, recv_time, rssi, snr)
-
-    def _store_group_message(self, frame, recv_time, rssi, snr):
-        """Parse a raw frame and, if it's a decodable group text, save it per-channel."""
+        # Parse once and dispatch by payload type. This runs even in the
+        # background so channel history and contacts stay up to date.
         packet = Packet.parse(frame)
         if not packet:
             return
-        if packet.payload_type not in (PayloadType.GRP_TXT, PayloadType.GRP_DATA):
+        if packet.payload_type in (PayloadType.GRP_TXT, PayloadType.GRP_DATA):
+            self._store_group_message(packet, recv_time, rssi, snr)
+        elif packet.payload_type == PayloadType.ADVERT:
+            self._store_advert(packet)
+        elif packet.payload_type == PayloadType.TXT_MSG:
+            self._store_direct_message(packet, recv_time)
+
+    def _store_direct_message(self, packet, recv_time):
+        """Decode a direct message addressed to us, ACK it, and store it."""
+        decoded = DirectText.decode(packet.payload, self.identity, contacts)
+        if not decoded:
             return
+        # Always ACK (even duplicates) so the sender stops retransmitting.
+        self._send_ack(decoded.ack_hash)
+        # Drop duplicates: the timestamp is stable across the sender's retries.
+        dedup_key = (decoded.sender_key, decoded.timestamp, decoded.text)
+        if dedup_key in self._recent_dm:
+            return
+        self._recent_dm.append(dedup_key)
+        self._append_dm(
+            decoded.sender_key,
+            DirectMessage(recv_time, decoded.timestamp, False, decoded.text))
+        print("[MeshCore] DM from '{}': {}".format(decoded.sender_name, decoded.text))
+
+    def _send_ack(self, ack_hash):
+        """Reply with an ACK, delayed slightly so the sender is back in RX."""
+        try:
+            packet = Ack(ack_hash).to_bytes()
+        except Exception as e:
+            print("[MeshCore] ACK build failed:", e)
+            return
+        try:
+            aio.create_task(self._delayed_send(packet, 200))
+        except Exception as e:
+            print("[MeshCore] ACK schedule error:", e)
+
+    async def _delayed_send(self, packet, delay_ms):
+        try:
+            await aio.sleep_ms(delay_ms)
+            await self.badge.lora.send(packet)
+        except Exception as e:
+            print("[MeshCore] delayed send error:", e)
+
+    def _append_dm(self, pubkey_hex, message):
+        thread = self.dm_messages.get(pubkey_hex)
+        if thread is None:
+            thread = deque([], self.dm_buffer_len)
+            self.dm_messages[pubkey_hex] = thread
+        thread.append(message)
+
+    def _store_advert(self, packet):
+        """Decode an advert and create/update the corresponding contact."""
+        decoded = Advert.decode(packet.payload)
+        if not decoded:
+            return
+        contact = contacts.upsert_from_advert(decoded)
+        print("[MeshCore] Advert from '{}' ({})".format(
+            contact.display_name, contact.short_key))
+
+    def _store_group_message(self, packet, recv_time, rssi, snr):
+        """Store a decodable group text in its channel's message history."""
         decoded = GroupText.decode(packet.payload, registry)
         if not decoded:
             return
@@ -239,6 +341,12 @@ class MeshcoreApp(BaseApp):
             self._run_channel_delete()
         elif self.mode == MODE_DM:
             self._run_dm()
+        elif self.mode == MODE_CONTACTS_ALL:
+            self._run_contacts_all()
+        elif self.mode == MODE_CONTACT_DETAILS:
+            self._run_contact_details()
+        elif self.mode == MODE_DM_CHAT:
+            self._run_dm_chat()
         elif self.mode == MODE_ADVERT:
             self._run_advert()
 
@@ -261,7 +369,13 @@ class MeshcoreApp(BaseApp):
         elif mode == MODE_CHANNEL_DELETE:
             self._build_channel_delete()
         elif mode == MODE_DM:
-            self._build_placeholder("Direct Messages", "DM mode coming soon.")
+            self._build_dm()
+        elif mode == MODE_CONTACTS_ALL:
+            self._build_contacts_all()
+        elif mode == MODE_CONTACT_DETAILS:
+            self._build_contact_details()
+        elif mode == MODE_DM_CHAT:
+            self._build_dm_chat()
         elif mode == MODE_ADVERT:
             self._build_advert()
 
@@ -321,52 +435,59 @@ class MeshcoreApp(BaseApp):
         self.page.create_menubar(["Open", "Add", "Del", "Menu", "Home"])
         self.page.replace_screen()
 
-    def _draw_channel_list(self):
-        """Render a windowed, highlight-bar selection list of channels.
+    def _render_list(self, rows, sel, empty_text):
+        """Render a windowed, highlight-bar selection list of strings.
 
         Windowing keeps the selected row on screen (scroll-into-view), and the
-        selected row gets a filled background bar instead of a text marker."""
-        for label in self._chan_labels:
-            label.delete()
-        self._chan_labels = []
+        selected row gets a filled background bar. Returns the created label
+        widgets so the caller can store and later delete them.
+        """
+        labels = []
         if not self.page or not self.page.content:
-            return
+            return labels
 
-        rows = self._channel_rows()
         if not rows:
             empty = lvgl.label(self.page.content)
             empty.add_style(styles.content_style, 0)
             empty.align(lvgl.ALIGN.TOP_LEFT, 8, 5)
-            empty.set_text("(no channels configured)")
-            self._chan_labels.append(empty)
-            return
+            empty.set_text(empty_text)
+            labels.append(empty)
+            return labels
 
         # Determine the visible window, centering the selection when possible.
         max_visible = self.LIST_MAX_VISIBLE
         start = 0
         if len(rows) > max_visible:
-            start = max(0, self.channel_sel - max_visible // 2)
+            start = max(0, sel - max_visible // 2)
             start = min(start, len(rows) - max_visible)
         end = min(start + max_visible, len(rows))
 
         y = 4
         for i in range(start, end):
-            name, count = rows[i]
             label = lvgl.label(self.page.content)
             label.add_style(styles.content_style, 0)
             label.set_width(lvgl.pct(100))
             label.set_style_pad_top(2, 0)
             label.set_style_pad_bottom(2, 0)
             label.set_style_pad_left(8, 0)
-            label.set_text("{}   {}".format(name, count))
-            if i == self.channel_sel:
+            label.set_text(rows[i])
+            if i == sel:
                 # Highlight bar: filled background with inverted text.
                 label.set_style_bg_color(styles.lcd_color_fg, 0)
                 label.set_style_bg_opa(255, 0)
                 label.set_style_text_color(styles.lcd_color_bg, 0)
             label.align(lvgl.ALIGN.TOP_LEFT, 0, y)
-            self._chan_labels.append(label)
+            labels.append(label)
             y += self.LIST_ROW_PX
+        return labels
+
+    def _draw_channel_list(self):
+        """Render the channel selection list."""
+        for label in self._chan_labels:
+            label.delete()
+        rows = ["{}   {}".format(name, count) for name, count in self._channel_rows()]
+        self._chan_labels = self._render_list(
+            rows, self.channel_sel, "(no channels configured)")
 
     def _build_channel_view(self):
         cid = self.active_channel_id
@@ -654,8 +775,233 @@ class MeshcoreApp(BaseApp):
         if self.badge.keyboard.f1() and cid not in PROTECTED_CHANNELS:
             self._commit_delete()
 
+    # ------------------------------------------------------------------
+    # Contacts / Direct Messages
+    # ------------------------------------------------------------------
+    def _contact_rows(self):
+        """Format the active contact order into display strings (star + name)."""
+        rows = []
+        for c in self._contact_order:
+            star = "* " if c.favorite else "  "
+            rows.append("{}{}".format(star, c.display_name))
+        return rows
+
+    def _draw_contact_list(self, empty_text):
+        for label in self._contact_labels:
+            label.delete()
+        self._contact_labels = self._render_list(
+            self._contact_rows(), self.contact_sel, empty_text)
+
+    def _set_contact_order(self, order):
+        self._contact_order = order
+        if self.contact_sel >= len(order):
+            self.contact_sel = max(0, len(order) - 1)
+
+    def _selected_contact(self):
+        if 0 <= self.contact_sel < len(self._contact_order):
+            return self._contact_order[self.contact_sel]
+        return None
+
+    def _build_dm(self):
+        """DM landing screen: the user's favorite contacts."""
+        self._set_contact_order(contacts.favorites())
+        self.page = Page()
+        self.page.create_infobar(["Direct Messages", "Favorites"])
+        self.page.create_content()
+        self._contact_labels = []
+        self._draw_contact_list("(no favorites - F2 for all contacts)")
+        self.page.create_menubar(["Open", "Contacts", "", "Menu", "Home"])
+        self.page.replace_screen()
+
     def _run_dm(self):
-        pass
+        key = self.badge.keyboard.read_key()
+        if key == self.badge.keyboard.UP:
+            self.contact_sel = max(0, self.contact_sel - 1)
+            self._draw_contact_list("(no favorites - F2 for all contacts)")
+        elif key == self.badge.keyboard.DOWN:
+            self.contact_sel = min(
+                max(0, len(self._contact_order) - 1), self.contact_sel + 1)
+            self._draw_contact_list("(no favorites - F2 for all contacts)")
+
+        if self.badge.keyboard.f1():  # Open chat with the selected favorite
+            c = self._selected_contact()
+            if c:
+                self.active_dm_key = c.pubkey_hex
+                self._set_mode(MODE_DM_CHAT)
+        elif self.badge.keyboard.f2():  # All contacts
+            self.contact_sel = 0
+            self._set_mode(MODE_CONTACTS_ALL)
+
+    def _build_contacts_all(self):
+        """All known contacts (favorites first)."""
+        self._set_contact_order(contacts.all())
+        self.page = Page()
+        self.page.create_infobar(["All Contacts", "{} known".format(len(contacts))])
+        self.page.create_content()
+        self._contact_labels = []
+        self._draw_contact_list("(no contacts yet)")
+        self.page.create_menubar(["Details", "Back", "", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _run_contacts_all(self):
+        key = self.badge.keyboard.read_key()
+        if key == self.badge.keyboard.UP:
+            self.contact_sel = max(0, self.contact_sel - 1)
+            self._draw_contact_list("(no contacts yet)")
+        elif key == self.badge.keyboard.DOWN:
+            self.contact_sel = min(
+                max(0, len(self._contact_order) - 1), self.contact_sel + 1)
+            self._draw_contact_list("(no contacts yet)")
+
+        if self.badge.keyboard.f1():  # Details
+            c = self._selected_contact()
+            if c:
+                self.active_contact_key = c.pubkey_hex
+                self._set_mode(MODE_CONTACT_DETAILS)
+        elif self.badge.keyboard.f2():  # Back to favorites landing
+            self.contact_sel = 0
+            self._set_mode(MODE_DM)
+
+    def _build_contact_details(self):
+        c = contacts.get(self.active_contact_key)
+        self.page = Page()
+        self.page.create_infobar(["Contact", ""])
+        self.page.create_content()
+        if not c:
+            self._content_label("Contact no longer available.")
+            self.page.create_menubar(["", "", "Back", "Menu", "Home"])
+            self.page.replace_screen()
+            return
+        if c.last_seen:
+            t = time.localtime(c.last_seen)
+            seen = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}".format(
+                t[0], t[1], t[2], t[3], t[4])
+        else:
+            seen = "never"
+        lines = [
+            "Name: {}".format(c.display_name),
+            "Key:  {}".format(c.pubkey_hex[:32]),
+            "      {}".format(c.pubkey_hex[32:]),
+            "Favorite: {}".format("yes" if c.favorite else "no"),
+            "Flags: 0x{:02x}".format(c.flags),
+            "Last seen: {}".format(seen),
+        ]
+        self._content_label("\n".join(lines))
+        fav_label = "Unfav" if c.favorite else "Fav"
+        self.page.create_menubar([fav_label, "Delete", "Back", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _run_contact_details(self):
+        if self.badge.keyboard.escape_pressed or self.badge.keyboard.f3():  # Back
+            self._set_mode(MODE_CONTACTS_ALL)
+            return
+        if self.badge.keyboard.f1():  # Toggle favorite
+            c = contacts.toggle_favorite(self.active_contact_key)
+            if c:
+                if c.favorite:
+                    self._persist_favorite(c)
+                else:
+                    self._unpersist_favorite(c.pubkey_hex)
+                self._build_contact_details()  # Refresh state + button label
+            return
+        if self.badge.keyboard.f2():  # Delete
+            key = self.active_contact_key
+            c = contacts.get(key)
+            was_fav = c.favorite if c else False
+            contacts.remove(key)
+            if was_fav:
+                self._unpersist_favorite(key)
+            self.active_contact_key = None
+            self.contact_sel = 0
+            self._set_mode(MODE_CONTACTS_ALL)
+
+    # ------------------------------------------------------------------
+    # Direct-message chat
+    # ------------------------------------------------------------------
+    def _build_dm_chat(self):
+        c = contacts.get(self.active_dm_key)
+        name = c.display_name if c else (self.active_dm_key or "?")[:8]
+        self.page = Page()
+        self.page.create_infobar(["DM: {}".format(name), ""])
+        self.page.create_content()
+        self.page.add_message_rows(1, left_width=90)
+        self._view_msg_count = -1
+        self.compose_active = False
+        self._refresh_dm_view()
+        self.page.create_menubar(["Send", "", "Back", "Menu", "Home"])
+        self.page.replace_screen()
+
+    def _refresh_dm_view(self):
+        """Re-populate the DM thread only when the message count changed."""
+        msgs = self.dm_messages.get(self.active_dm_key)
+        count = len(msgs) if msgs else 0
+        if count == self._view_msg_count:
+            return
+        self._view_msg_count = count
+        if not msgs:
+            self.page.populate_message_rows([("", "No messages yet.")])
+            return
+        display = []
+        for m in msgs:
+            t = time.localtime(m.recv_time)
+            time_str = "{:02d}:{:02d}".format(t[3], t[4])
+            who = "me" if m.outgoing else "them"
+            display.append((time_str, "{}: {}".format(who, m.text)))
+        self.page.populate_message_rows(display)
+
+    def _run_dm_chat(self):
+        if not self.compose_active and self.badge.keyboard.f1():  # Compose
+            self.page.create_text_box()
+            self.compose_active = True
+
+        if self.compose_active:
+            key, text = self.page.text_box_type(self.badge.keyboard)
+            self.page.infobar_right.set_text(
+                "{}/{}  F1 to send".format(len(text), MAX_MESSAGE_LEN))
+            if self.badge.keyboard.escape_pressed:
+                self.page.close_text_box()
+                self.compose_active = False
+            if self.badge.keyboard.f1():  # Send
+                if self.page.text_box.get_text():
+                    message_text = self.page.close_text_box()
+                    self._send_direct_txt(message_text)
+                    self.compose_active = False
+            return
+
+        if self.badge.keyboard.f3():  # Back to favorites
+            self._set_mode(MODE_DM)
+            return
+        # Keep the view in sync as new messages arrive while open.
+        self._refresh_dm_view()
+        key = self.badge.keyboard.read_key()
+        scroll = 13
+        if self.badge.keyboard.shift_pressed:
+            scroll *= 5
+        if key == self.badge.keyboard.UP:
+            self.page.scroll_up(scroll)
+        elif key == self.badge.keyboard.DOWN:
+            self.page.scroll_down(scroll)
+
+    def _send_direct_txt(self, message):
+        if not self.identity:
+            self.page.infobar_right.set_text("No identity")
+            return
+        c = contacts.get(self.active_dm_key)
+        if c is None:
+            self.page.infobar_right.set_text("Unknown contact")
+            return
+        try:
+            packet = DirectText(self.identity, c, message).to_bytes()
+        except Exception as e:
+            import sys
+            print("[MeshCore] DM packet build failed:", e)
+            sys.print_exception(e)
+            self.page.infobar_right.set_text("Build error")
+            return
+        print("[MeshCore] Sending DM packet:", packet.hex())
+        self._transmit(packet)
+        now = int(time.time())
+        self._append_dm(self.active_dm_key, DirectMessage(now, now, True, message))
 
     # ------------------------------------------------------------------
     # Advert flow

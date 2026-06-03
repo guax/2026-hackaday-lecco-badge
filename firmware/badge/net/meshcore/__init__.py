@@ -15,10 +15,19 @@ from net.meshcore.channel import (
     registry,
 )
 from net.meshcore.identity import Identity
+from net.meshcore.contact import (
+    Contact,
+    ContactBook,
+    contacts,
+    MAX_CONTACTS,
+)
 from net.meshcore.packet import (
     Packet,
     Advert,
+    DecodedAdvert,
     GroupText,
     DecodedGroupText,
     DirectText,
+    DecodedDirectText,
+    Ack,
 )

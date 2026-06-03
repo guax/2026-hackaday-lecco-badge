@@ -2,9 +2,18 @@
 
 import struct
 import time
+from collections import namedtuple
 
 from net.meshcore.constants import RouteType, PayloadType, AdvertFlag
 from net.meshcore.packet.base import Packet
+
+# Fixed advert header: pubkey(32) + timestamp(4) + signature(64) = 100 bytes.
+_ADVERT_HEADER_LEN = 100
+
+# Decoded result returned by Advert.decode().
+DecodedAdvert = namedtuple(
+    "DecodedAdvert", ["pubkey_hex", "name", "flags", "timestamp"]
+)
 
 
 class Advert(Packet):
@@ -37,3 +46,36 @@ class Advert(Packet):
         payload.extend(signature)                  # 64 bytes
         payload.extend(app_data)                   # flags + name
         return bytes(payload)
+
+    @classmethod
+    def decode(cls, payload):
+        """Decode an ADVERT payload into a DecodedAdvert, or None if malformed.
+
+        Layout: pubkey(32) + timestamp(4 LE) + signature(64) + app_data.
+        app_data = flags(1) [+ lat(4)+lon(4) if HAS_LOCATION] + name (UTF-8).
+        The signature is not verified here.
+        """
+        if len(payload) < _ADVERT_HEADER_LEN + 1:
+            return None
+
+        pubkey = payload[:32]
+        timestamp = struct.unpack("<I", payload[32:36])[0]
+        app_data = payload[_ADVERT_HEADER_LEN:]
+        if not app_data:
+            return None
+
+        flags = app_data[0]
+        idx = 1
+        if flags & AdvertFlag.HAS_LOCATION:
+            idx += 8  # int32 lat + int32 lon
+
+        name = ""
+        if flags & AdvertFlag.HAS_NAME:
+            try:
+                name = app_data[idx:].rstrip(b"\x00").decode("utf-8")
+            except Exception:
+                name = ""
+
+        return DecodedAdvert(
+            "".join("%02x" % b for b in pubkey), name, flags, timestamp
+        )
