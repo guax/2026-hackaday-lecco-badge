@@ -30,4 +30,5 @@ from net.meshcore.packet import (
     DirectText,
     DecodedDirectText,
     Ack,
+    PathReturn,
 )

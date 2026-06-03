@@ -14,6 +14,7 @@ from net.meshcore import (
     GroupText,
     DirectText,
     Ack,
+    PathReturn,
     Channel,
     Identity,
     DEFAULT_CHANNELS,
@@ -240,8 +241,8 @@ class MeshcoreApp(BaseApp):
         decoded = DirectText.decode(packet.payload, self.identity, contacts)
         if not decoded:
             return
-        # Always ACK (even duplicates) so the sender stops retransmitting.
-        self._send_ack(decoded.ack_hash)
+        # Always reply (even to duplicates) so the sender stops retransmitting.
+        self._send_dm_ack(packet, decoded)
         # Drop duplicates: the timestamp is stable across the sender's retries.
         dedup_key = (decoded.sender_key, decoded.timestamp, decoded.text)
         if dedup_key in self._recent_dm:
@@ -252,15 +253,32 @@ class MeshcoreApp(BaseApp):
             DirectMessage(recv_time, decoded.timestamp, False, decoded.text))
         print("[MeshCore] DM from '{}': {}".format(decoded.sender_name, decoded.text))
 
-    def _send_ack(self, ack_hash):
-        """Reply with an ACK, delayed slightly so the sender is back in RX."""
+    def _send_dm_ack(self, packet, decoded):
+        """Reply to a received DM, delayed so the sender is back in RX.
+
+        For flood-routed messages we return a PATH packet (with the ACK embedded)
+        so the sender learns the route to us and can switch to direct routing,
+        reducing flood noise on the mesh. For already-direct messages we send a
+        plain ACK.
+        """
+        is_flood = packet.route_type in (RouteType.FLOOD, RouteType.TRANSPORT_FLOOD)
         try:
-            packet = Ack(ack_hash).to_bytes()
+            if is_flood:
+                peer = bytes.fromhex(decoded.sender_key)
+                path_len_byte = (((packet.hash_size - 1) & 0x03) << 6) \
+                    | (packet.hop_count & 0x3F)
+                reply = PathReturn(
+                    self.identity, peer, packet.path, path_len_byte,
+                    PayloadType.ACK, decoded.ack_hash).to_bytes()
+            else:
+                reply = Ack(decoded.ack_hash).to_bytes()
         except Exception as e:
-            print("[MeshCore] ACK build failed:", e)
+            import sys
+            print("[MeshCore] ACK/path build failed:", e)
+            sys.print_exception(e)
             return
         try:
-            aio.create_task(self._delayed_send(packet, 200))
+            aio.create_task(self._delayed_send(reply, 200))
         except Exception as e:
             print("[MeshCore] ACK schedule error:", e)
 
