@@ -26,7 +26,7 @@ from net.meshcore import (
     contacts,
 )
 from ui import styles
-from ui.page import Page
+from ui.pagebutbetter import PageButBetter
 
 # Persistent store (separate from the main badge config) holding user channels.
 CHANNEL_STORE_NAME = "meshcore_channels"
@@ -146,7 +146,7 @@ class MeshcoreApp(BaseApp):
                 if alias:
                     self.node_name = alias[:32]
                     return self.node_name
-        except Exception as e: 
+        except Exception as e:
             print(f"[MeshCore] Error getting node name: {e}")
             pass
         return "Hackbadge"
@@ -445,7 +445,7 @@ class MeshcoreApp(BaseApp):
         return label
 
     def _build_menu(self):
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["MeshCore", "Main Menu"])
         self.page.create_content()
         self._content_label(
@@ -484,7 +484,7 @@ class MeshcoreApp(BaseApp):
 
     def _build_channels(self):
         self._refresh_channel_order()
-        self.page = Page()
+        self.page = PageButBetter();
         self.page.create_infobar(["Channels", "Up/Dn select"])
         self.page.create_content()
         self._chan_labels = []
@@ -549,7 +549,7 @@ class MeshcoreApp(BaseApp):
     def _build_channel_view(self):
         cid = self.active_channel_id
         name = self.channel_names.get(cid) or self._name_for(cid)
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Channel: {}".format(name), ""])
         self.page.create_content()
         self.page.add_message_rows(1, left_width=90)
@@ -583,7 +583,7 @@ class MeshcoreApp(BaseApp):
         return ch.name if ch else channel_id[:8]
 
     def _build_placeholder(self, title, body):
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["MeshCore", title])
         self.page.create_content()
         self._content_label(body)
@@ -595,7 +595,7 @@ class MeshcoreApp(BaseApp):
     # ------------------------------------------------------------------
     def _build_channel_add(self):
         """Step 1: choose the channel type."""
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Add Channel", "Choose type"])
         self.page.create_content()
         self._content_label(
@@ -606,7 +606,7 @@ class MeshcoreApp(BaseApp):
         self.page.replace_screen()
 
     def _build_text_input(self, prompt, default="", char_limit=0):
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar([prompt, "F1=OK  ESC=cancel"])
         self.page.create_content()
         self.page.create_text_box(
@@ -670,7 +670,7 @@ class MeshcoreApp(BaseApp):
     # ------------------------------------------------------------------
     def _build_channel_delete(self):
         cid, name = self._channel_order[self.channel_sel]
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Delete Channel", ""])
         self.page.create_content()
         if cid in PROTECTED_CHANNELS:
@@ -734,7 +734,7 @@ class MeshcoreApp(BaseApp):
         if not self.compose_active and self.badge.keyboard.f1():  # Compose a message
             self.page.create_text_box()
             self.compose_active = True
-        
+
         if self.compose_active:
             key, text = self.page.text_box_type(self.badge.keyboard)
             self.page.infobar_right.set_text(f"{len(text)}/{MAX_MESSAGE_LEN}  F1 to send")
@@ -864,7 +864,7 @@ class MeshcoreApp(BaseApp):
     def _build_dm(self):
         """DM landing screen: the user's favorite contacts."""
         self._set_contact_order(contacts.favorites())
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Direct Messages", "Favorites"])
         self.page.create_content()
         self._contact_labels = []
@@ -894,7 +894,7 @@ class MeshcoreApp(BaseApp):
     def _build_contacts_all(self):
         """All known contacts (favorites first)."""
         self._set_contact_order(contacts.all())
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["All Contacts", "{} known".format(len(contacts))])
         self.page.create_content()
         self._contact_labels = []
@@ -923,7 +923,7 @@ class MeshcoreApp(BaseApp):
 
     def _build_contact_details(self):
         c = contacts.get(self.active_contact_key)
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Contact", ""])
         self.page.create_content()
         if not c:
@@ -980,7 +980,7 @@ class MeshcoreApp(BaseApp):
     def _build_dm_chat(self):
         c = contacts.get(self.active_dm_key)
         name = c.display_name if c else (self.active_dm_key or "?")[:8]
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["DM: {}".format(name), ""])
         self.page.create_content()
         self.page.add_message_rows(1, left_width=90)
@@ -994,7 +994,7 @@ class MeshcoreApp(BaseApp):
         """Re-populate the DM thread."""
         msgs = self.dm_messages.get(self.active_dm_key)
         count = len(msgs) if msgs else 0
-        
+
         has_sending = False
         if msgs:
             for m in msgs:
@@ -1004,7 +1004,7 @@ class MeshcoreApp(BaseApp):
 
         if count == self._view_msg_count and not has_sending:
             return
-            
+
         self._view_msg_count = count
         if not msgs:
             self.page.populate_message_rows([("", "No messages yet.")])
@@ -1014,7 +1014,7 @@ class MeshcoreApp(BaseApp):
             t = time.localtime(m.recv_time)
             time_str = "{:02d}:{:02d}".format(t[3], t[4])
             who = "me" if m.outgoing else "them"
-            
+
             if m.outgoing:
                 if m.delivered:
                     status = ("Delivered", styles.lvg_color_green, styles.hackaday_white)
@@ -1087,7 +1087,7 @@ class MeshcoreApp(BaseApp):
     # Advert flow
     # ------------------------------------------------------------------
     def _build_advert(self):
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Advert", ""])
         self.page.create_content()
         if not self.identity:
@@ -1183,7 +1183,7 @@ class MeshcoreApp(BaseApp):
         return "?"
 
     def _build_analyser(self):
-        self.page = Page()
+        self.page = PageButBetter()
         self.page.create_infobar(["Packet Analyser", "{} pkts".format(len(self.packet_queue))])
         self.page.create_content()
         self._analyser_paused = False
