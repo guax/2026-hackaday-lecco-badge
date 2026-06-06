@@ -7,7 +7,7 @@ import lvgl
 import time
 from apps.base_app import BaseApp
 from hardware.datafile import DataFile
-from net.net import register_raw_receiver, unregister_raw_receiver
+from net.net import register_raw_receiver
 from net.meshcore import (
     Packet,
     Advert,
