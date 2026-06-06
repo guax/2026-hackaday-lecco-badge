@@ -9,7 +9,6 @@ from ui.page import Page
 
 CONFIG_OVERRIDE = Protocol(port=4, name="CONFIG_OVERRIDE", structdef="!128s20s80s")
 
-
 class ConfigManager(BaseApp):
     """View and edit badge config file."""
 
@@ -97,7 +96,7 @@ class ConfigManager(BaseApp):
             key = self.badge.keyboard.read_key()
             if key == self.badge.keyboard.UP:
                 if self.badge.keyboard.shift_pressed:
-                    self.page.scroll_up(13)
+                    self.page.scroll_up(16)
                 else:
                     self.page.message_rows.set_cell_value(
                         self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
@@ -108,7 +107,7 @@ class ConfigManager(BaseApp):
                     )
             elif key == self.badge.keyboard.DOWN:
                 if self.badge.keyboard.shift_pressed:
-                    self.page.scroll_down(13)
+                    self.page.scroll_down(16)
                 else:
                     self.page.message_rows.set_cell_value(
                         self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
@@ -118,35 +117,29 @@ class ConfigManager(BaseApp):
                         self.cursor_pos, 1, f"> {self.config[self.cursor_pos][1]}"
                     )
             if self.badge.keyboard.f1():
-                try:
-                    int(self.config[self.cursor_pos][1])
-                    print("Not allowed to edit numeric configs, sorry")
-                    if self.badge.crypto.private_key is not None:
-                        raise ValueError(42)
-                except ValueError:
-                    self.page.create_text_box(
-                        self.config[self.cursor_pos][1],
-                        one_line=True,
-                    )
-                    self.edit_active = True
+                self.page.create_text_box(
+                    self.config[self.cursor_pos][1],
+                    one_line=True,
+                )
+                self.edit_active = True
             if self.badge.keyboard.f3():
-                    self.page.scroll_up(13)
-                    self.page.message_rows.set_cell_value(
-                        self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
-                    )
-                    self.cursor_pos = max(0, self.cursor_pos - 1)
-                    self.page.message_rows.set_cell_value(
-                        self.cursor_pos, 1, f"> {self.config[self.cursor_pos][1]}"
-                    )
+                self.page.scroll_up(16)
+                self.page.message_rows.set_cell_value(
+                    self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
+                )
+                self.cursor_pos = max(0, self.cursor_pos - 1)
+                self.page.message_rows.set_cell_value(
+                    self.cursor_pos, 1, f"> {self.config[self.cursor_pos][1]}"
+                )
             if self.badge.keyboard.f4():
-                    self.page.scroll_down(13)
-                    self.page.message_rows.set_cell_value(
-                        self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
-                    )
-                    self.cursor_pos = min(len(self.config) - 1, self.cursor_pos + 1)
-                    self.page.message_rows.set_cell_value(
-                        self.cursor_pos, 1, f"> {self.config[self.cursor_pos][1]}"
-                    )
+                self.page.scroll_down(16)
+                self.page.message_rows.set_cell_value(
+                    self.cursor_pos, 1, f"   {self.config[self.cursor_pos][1]}"
+                )
+                self.cursor_pos = min(len(self.config) - 1, self.cursor_pos + 1)
+                self.page.message_rows.set_cell_value(
+                    self.cursor_pos, 1, f"> {self.config[self.cursor_pos][1]}"
+                )
 
     def switch_to_foreground(self):
         self._reload_config()
@@ -167,7 +160,7 @@ class ConfigManager(BaseApp):
     def switch_to_background(self):
         """Save configs to flash and go back to main menu"""
         for key, value in self.config:
-            self.badge.config.set(key, value)
+            self.badge.config.set(key, value.encode())
         self.badge.config.flush()
         self.page = None
         super().switch_to_background()
