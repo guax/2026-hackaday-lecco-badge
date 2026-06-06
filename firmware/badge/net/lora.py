@@ -10,19 +10,15 @@ from hardware import board
 
 
 class LoraRadio:
-    def __init__(self, tx_led=None, tx_power=9):
+    def __init__(self, tx_led=None, tx_power=9, frequency=869.525, bandwidth=250.0, spreading_factor=7, coding_rate=5):
+        # Defaults are overriten by the ones set on badge.py
         # Settings
         # https://meshtastic.org/docs/overview/radio-settings/
         self.freq_slot = 1
-        self.frequency = 869.525  # MHz: Only one slot in EU
-
-        self.bandwidth = 250.0  # 250000  # kHz: 31000, 125000, or 250000
-        self.coding_rate = (
-            5  # 4/x bit redundancy, increases reliability but decreases datarate: 5 - 8
-        )
-        self.spreading_factor = (
-            7  # 1<<x num chirps per symbol, each step doubles airtime, adds 2.5dB: 7-12
-        )
+        self.frequency = frequency
+        self.bandwidth = bandwidth
+        self.coding_rate = coding_rate  # 4/x bit redundancy, increases reliability but decreases datarate: 5 - 8
+        self.spreading_factor = spreading_factor  # 1<<x num chirps per symbol, each step doubles airtime, adds 2.5dB: 7-12
         self.preamble_length = 16
         self.crc = True
         self.tx_power = tx_power
