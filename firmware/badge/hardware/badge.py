@@ -1,4 +1,6 @@
 import asyncio as aio
+import time
+import lvgl
 from machine import I2C
 
 from hardware import board
@@ -57,6 +59,8 @@ class Badge:
         self.display: Display = Display()
         self.display.backlight.duty(500)
         self.keyboard: Keyboard = Keyboard()
+
+        self.keyboard.register_meta_action("p", self.take_screenshot)
 
         self.crypto = Crypto()
 
@@ -123,3 +127,20 @@ class Badge:
 
     def check_background_current_app(self):
         return False
+
+    def take_screenshot(self):
+        try:
+            print("Taking screenshot...")
+            scr = lvgl.screen_active()
+            snapshot = lvgl.snapshot_take(scr, lvgl.COLOR_FORMAT.RGB565)
+            if snapshot:
+                data_size = snapshot.data_size
+                buffer = snapshot.data.__dereference__(data_size)
+                
+                filename = f"/screenshot_{time.ticks_ms()}.raw"
+                with open(filename, "wb") as f:
+                    f.write(buffer)
+                print(f"Screenshot saved to {filename}")
+                snapshot.destroy()
+        except Exception as e:
+            print("Failed to take screenshot:", e)
