@@ -15,19 +15,6 @@ class Badge:
     This is a singleton accessed by all the apps.
     From the REPL, you can `from hardware.badge import badge_obj` to get this.
     """
-    def _setup_defaults(self):
-        self._setup_default_config_value("alias", "")
-        self._setup_default_config_value("nametag", "Your Name Here!")
-        self._setup_default_config_value("nametag_show_image", b'false')
-        self._setup_default_config_value("nametag_image", b'images/headshots/wrencher.png')
-        self._setup_default_config_value("radio_tx_power", b'9')
-        self._setup_default_config_value("radio_frequency", b'869.618')
-        self._setup_default_config_value("radio_bandwidth", b'62.5')
-        self._setup_default_config_value("radio_spreading_factor", b'7')
-        self._setup_default_config_value("radio_coding_rate", b'5')
-        self._setup_default_config_value("chat_ttl", b'3')
-        self._setup_default_config_value("send_cooldown_ms", b'1')
-
     def __init__(self):
         global badge_obj
         if badge_obj is not None:
