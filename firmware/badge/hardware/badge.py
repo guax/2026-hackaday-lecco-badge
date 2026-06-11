@@ -137,7 +137,7 @@ class Badge:
                 data_size = snapshot.data_size
                 buffer = snapshot.data.__dereference__(data_size)
                 
-                filename = f"/screenshot_{time.ticks_ms()}.raw"
+                filename = f"/data/screenshot_{time.ticks_ms()}.raw"
                 with open(filename, "wb") as f:
                     f.write(buffer)
                 print(f"Screenshot saved to {filename}")
