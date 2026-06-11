@@ -8,7 +8,7 @@ from PIL import Image
 Screenshots can be taken on device using the jolly rancher + p key combination.
 Its a bit finicky but it does work. You then copy the raw file out of the device with mpremote and convert it.
 Example:
-    mpremote cp :/screenshot_11658.raw .
+    mpremote cp :/data/screenshot_11658.raw .
     ./convert_screenshot.py screenshot_11658.raw screenshot_11658.png
 """
 def convert_rgb565_to_png(input_path, output_path, width=428, height=142, swap=False):
